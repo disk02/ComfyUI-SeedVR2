@@ -9,6 +9,7 @@ import argparse
 import time
 import platform
 import multiprocessing as mp
+import json
 
 # Set up path before any other imports to fix module resolution
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -45,9 +46,365 @@ from datetime import datetime
 from pathlib import Path
 from src.utils.downloads import download_weight
 from src.utils.debug import Debug
+from src.core.generation import prepare_video_transforms
 
 debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
 
+
+def nearest_lower_4n_plus_1(x: int) -> int:
+    x = int(x)
+    if x <= 1:
+        return 1
+    return ((x - 1) // 4) * 4 + 1
+
+
+def next_4n_plus_1(x: int) -> int:
+    x = max(1, int(x))
+    remainder = (x - 1) % 4
+    if remainder == 0:
+        return x
+    return x + (4 - remainder)
+
+
+def _try_import_psutil():
+    try:
+        import psutil  # type: ignore
+
+        return psutil
+    except Exception:
+        return None
+
+
+def probe_mem():
+    gpu_free, gpu_total = 0, 0
+    if torch.cuda.is_available():
+        try:
+            gpu_free, gpu_total = torch.cuda.mem_get_info()
+        except Exception:
+            gpu_free, gpu_total = 0, 0
+    psutil_mod = _try_import_psutil()
+    ram_free = psutil_mod.virtual_memory().available if psutil_mod else None
+    return gpu_free, gpu_total, ram_free
+
+
+def vram_per_frame_mib(model_name: str, out_h: int, out_w: int):
+    mpix = (out_h * out_w) / 1e6
+    name = model_name.lower()
+    if "7b" in name:
+        k = 50
+    elif "fp16" in name:
+        k = 35
+    else:
+        k = 20
+    return max(1.0, k * mpix)
+
+
+def pick_batch_size(model_name, out_h, out_w, gpu_free, gpu_total, target_frac,
+                    max_batch, min_batch, four_n_plus_one=True, est_override=None):
+    est = est_override if est_override is not None else vram_per_frame_mib(model_name, out_h, out_w)
+    est = max(est, 1.0)
+
+    target_frac = max(0.0, min(float(target_frac), 1.0))
+    if gpu_total <= 0 or target_frac <= 0.0:
+        target_vram_mib = 0.0
+    else:
+        target_vram_bytes = min(int(gpu_total * target_frac), int(gpu_free * 0.95))
+        target_vram_mib = max(0.0, target_vram_bytes / (1024 ** 2))
+
+    batch_raw = int(target_vram_mib / est) if est > 0 else 1
+    max_batch = max(1, int(max_batch))
+    min_batch = max(1, int(min_batch))
+
+    if four_n_plus_one:
+        cand = nearest_lower_4n_plus_1(batch_raw)
+    else:
+        cand = max(1, batch_raw)
+
+    cand = max(1, min(cand, max_batch))
+    # Do not force to min_batch here; allow caller to decide if raising is safe
+    return cand, target_vram_mib, est
+
+
+def pick_blocks_to_swap(model_name, desired_batch, got_batch):
+    if got_batch >= desired_batch:
+        return None
+    if "3b" in model_name.lower():
+        return 16
+    return 20
+
+
+def pick_load_cap(out_h, out_w, ram_free, ram_frac, dtype_bytes=4):
+    if ram_free is None:
+        return None
+    ram_frac = max(0.0, min(float(ram_frac), 1.0))
+    if ram_frac <= 0.0:
+        return None
+    per_frame = out_h * out_w * 3 * dtype_bytes
+    if per_frame <= 0:
+        return None
+    cap = int((ram_free * ram_frac) / per_frame)
+    return max(1, cap)
+
+
+def load_auto_cache(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            if isinstance(data, dict):
+                return data
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"AutoTune: failed to read cache '{path}': {exc}")
+    return {}
+
+
+def save_auto_cache(path, data):
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+    except Exception as exc:
+        print(f"AutoTune: failed to write cache '{path}': {exc}")
+
+
+def compute_output_resolution(height, width, target_short_side):
+    height = int(height)
+    width = int(width)
+    if height <= 0 or width <= 0:
+        return max(height, 0), max(width, 0)
+    dummy = torch.zeros(1, 3, height, width, dtype=torch.float32)
+    with torch.no_grad():
+        transform = prepare_video_transforms(target_short_side)
+        transformed = transform(dummy)
+    out_h = int(transformed.shape[-2])
+    out_w = int(transformed.shape[-1])
+    return out_h, out_w
+
+
+def get_video_metadata(video_path):
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video file: {video_path}")
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        cap.release()
+    return {
+        "fps": fps,
+        "frame_count": frame_count,
+        "width": width,
+        "height": height,
+    }
+
+
+def auto_tune(args, video_info):
+    model_name = args.model
+    height = int(video_info.get("height", 0) or 0)
+    width = int(video_info.get("width", 0) or 0)
+    frame_count = int(video_info.get("frame_count", 0) or 0)
+
+    out_h, out_w = compute_output_resolution(height, width, args.resolution)
+    in_short = max(1, min(height, width))
+    out_short = max(1, min(out_h, out_w))
+    scale = out_short / in_short
+
+    gpu_free, gpu_total, ram_free = probe_mem()
+
+    target_frac = float(args.auto_target_vram)
+    target_frac = max(0.05, min(target_frac, 0.99))
+
+    auto_min_batch = next_4n_plus_1(max(1, int(args.auto_min_batch)))
+    auto_max_input = max(auto_min_batch, int(args.auto_max_batch))
+    auto_max_batch = nearest_lower_4n_plus_1(auto_max_input)
+    if auto_max_batch < auto_min_batch:
+        auto_max_batch = auto_min_batch
+
+    overrides = {
+        "batch_size": "--batch_size" in sys.argv,
+        "load_cap": "--load_cap" in sys.argv,
+        "blocks_to_swap": "--blocks_to_swap" in sys.argv,
+    }
+
+    cache_path = os.path.expanduser(args.auto_cache) if args.auto_cache else None
+    cache_data = {}
+    cache_entry = {}
+    cache_key = None
+    if cache_path:
+        cache_data = load_auto_cache(cache_path)
+        cache_key = f"{model_name}|{out_w}x{out_h}"
+        entry = cache_data.get(cache_key)
+        if isinstance(entry, dict):
+            cache_entry = entry.copy()
+
+    blocks_to_swap = args.blocks_to_swap
+    cached_load_cap = None
+    if cache_entry:
+        if not overrides["blocks_to_swap"] and args.enable_blockswap:
+            cached_blocks = cache_entry.get("blocks_to_swap")
+            if cached_blocks is not None:
+                try:
+                    blocks_to_swap = max(0, int(cached_blocks))
+                except (TypeError, ValueError):
+                    pass
+        if not overrides["load_cap"]:
+            cached_cap = cache_entry.get("load_cap")
+            if cached_cap is not None:
+                try:
+                    cached_load_cap = max(0, int(cached_cap))
+                except (TypeError, ValueError):
+                    cached_load_cap = None
+
+    est = vram_per_frame_mib(model_name, out_h, out_w)
+    batch_candidate = max(1, args.batch_size)
+    target_vram_mib = 0.0
+    gpu_probe_available = torch.cuda.is_available() and gpu_total > 0
+
+    if gpu_probe_available:
+        batch_candidate, target_vram_mib, est = pick_batch_size(
+            model_name,
+            out_h,
+            out_w,
+            gpu_free,
+            gpu_total,
+            target_frac,
+            auto_max_batch,
+            auto_min_batch,
+            four_n_plus_one=True,
+        )
+        if cache_entry and not overrides["batch_size"]:
+            cached_batch = cache_entry.get("batch_size")
+            if cached_batch is not None:
+                cached_batch = max(1, int(cached_batch))
+                cached_batch = nearest_lower_4n_plus_1(cached_batch)
+                batch_candidate = max(1, min(cached_batch, auto_max_batch))
+    else:
+        print("AutoTune: CUDA not available—skipping batch auto")
+        batch_candidate = max(1, nearest_lower_4n_plus_1(batch_candidate))
+
+    adjusted_for_4n1 = False
+    if not overrides["batch_size"]:
+        four_candidate = nearest_lower_4n_plus_1(batch_candidate)
+        if four_candidate != batch_candidate:
+            adjusted_for_4n1 = True
+            batch_candidate = four_candidate
+        if batch_candidate > auto_max_batch:
+            batch_candidate = auto_max_batch
+        if batch_candidate < 1:
+            batch_candidate = 1
+
+    blockswap_override = overrides["blocks_to_swap"]
+    blockswap_allowed = args.enable_blockswap and not blockswap_override
+    blockswap_applied = False
+
+    blockswap_target = max(auto_min_batch, 5)
+    if (not overrides["batch_size"]) and gpu_probe_available and blockswap_allowed and batch_candidate < blockswap_target:
+        suggested_blocks = pick_blocks_to_swap(model_name, blockswap_target, batch_candidate)
+        if suggested_blocks:
+            blocks_to_swap = suggested_blocks
+            blockswap_applied = True
+            scale_factor = 0.7 if "7b" not in model_name.lower() else 0.6
+            est_with_blockswap = est * scale_factor
+            batch_candidate_bs, _, _ = pick_batch_size(
+                model_name,
+                out_h,
+                out_w,
+                gpu_free,
+                gpu_total,
+                target_frac,
+                auto_max_batch,
+                auto_min_batch,
+                four_n_plus_one=True,
+                est_override=est_with_blockswap,
+            )
+            batch_candidate = max(batch_candidate, batch_candidate_bs)
+            four_candidate = nearest_lower_4n_plus_1(batch_candidate)
+            if four_candidate != batch_candidate:
+                adjusted_for_4n1 = True
+                batch_candidate = four_candidate
+    elif (not overrides["batch_size"]) and batch_candidate < blockswap_target and not args.enable_blockswap:
+        print("AutoTune: batch_size limited by VRAM; enable --enable_blockswap for additional savings")
+
+    if not overrides["batch_size"]:
+        batch_candidate = max(1, min(batch_candidate, auto_max_batch))
+        args.batch_size = batch_candidate
+        if adjusted_for_4n1:
+            print(f"AutoTune: Adjusted batch_size to nearest 4n+1: {args.batch_size}")
+        if args.batch_size < 5:
+            print("AutoTune: batch_size remained below 5 due to limited VRAM; using per-frame mode")
+
+    if blockswap_allowed:
+        args.blocks_to_swap = blocks_to_swap
+    if blockswap_applied:
+        print(f"AutoTune: BlockSwap enabled with {args.blocks_to_swap} blocks to reach target batch size")
+
+    ram_frac = max(0.0, min(float(args.auto_ram_fraction), 1.0))
+    load_cap_applied = False
+    if ram_free is None and not overrides["load_cap"]:
+        print("AutoTune: psutil not available—skipping RAM auto")
+        if cached_load_cap is not None:
+            args.load_cap = cached_load_cap
+            load_cap_applied = True
+    if not overrides["load_cap"] and ram_free is not None and ram_frac > 0.0:
+        load_cap_candidate = pick_load_cap(out_h, out_w, ram_free, ram_frac)
+        if load_cap_candidate is not None:
+            if frame_count > 0:
+                load_cap_candidate = min(load_cap_candidate, frame_count)
+            args.load_cap = max(1, load_cap_candidate)
+            load_cap_applied = True
+
+    target_vram_gib = target_vram_mib / 1024 if target_vram_mib > 0 else 0.0
+
+    def fmt_scale(val):
+        text = f"{val:.3f}"
+        return text.rstrip("0").rstrip(".") if "." in text else text
+
+    def fmt_value(value, override_flag, auto_applied=False, zero_label="all"):
+        if value is None:
+            text = "None"
+        elif value == 0:
+            text = zero_label
+        else:
+            text = str(value)
+        if override_flag:
+            return f"{text} (user)"
+        if auto_applied:
+            return text
+        return text
+
+    batch_summary = fmt_value(args.batch_size, overrides["batch_size"], auto_applied=not overrides["batch_size"], zero_label="0")
+    load_cap_summary = fmt_value(args.load_cap, overrides["load_cap"], auto_applied=load_cap_applied)
+    blockswap_summary = fmt_value(args.blocks_to_swap, overrides["blocks_to_swap"], auto_applied=blockswap_applied or blockswap_allowed, zero_label="0")
+
+    print(
+        "AutoTune: "
+        f"out={out_w}x{out_h} model={model_name} s={fmt_scale(scale)}  "
+        f"vram_target={target_vram_gib:.2f} GiB  →  "
+        f"batch={batch_summary}  load_cap={load_cap_summary}  blocks_to_swap={blockswap_summary}"
+    )
+
+    if cache_path and cache_key:
+        cache_update = {}
+        if not overrides["batch_size"]:
+            cache_update["batch_size"] = args.batch_size
+        if not overrides["load_cap"] and load_cap_applied:
+            cache_update["load_cap"] = args.load_cap
+        if blockswap_allowed and not overrides["blocks_to_swap"]:
+            cache_update["blocks_to_swap"] = args.blocks_to_swap
+        if cache_update:
+            entry = cache_data.get(cache_key, {})
+            if not isinstance(entry, dict):
+                entry = {}
+            entry.update(cache_update)
+            cache_data[cache_key] = entry
+            save_auto_cache(cache_path, cache_data)
 
 def extract_frames_from_video(video_path, skip_first_frames=0, load_cap=None, prepend_frames=0):
     """
@@ -453,10 +810,22 @@ def parse_arguments():
                         help="Target resolution of the short side (default: 1072)")
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Number of frames per batch (default: 1)")
+    parser.add_argument("--auto", action="store_true",
+                        help="Enable automatic tuning for batch_size, load_cap, and blocks_to_swap")
+    parser.add_argument("--auto_target_vram", type=float, default=0.90,
+                        help="Target fraction of total GPU VRAM to use for auto batch sizing (default: 0.90)")
+    parser.add_argument("--auto_ram_fraction", type=float, default=0.50,
+                        help="Fraction of free system RAM to allocate when auto-selecting load_cap (default: 0.50)")
+    parser.add_argument("--auto_max_batch", type=int, default=125,
+                        help="Maximum batch size candidate for auto mode (default: 125)")
+    parser.add_argument("--auto_min_batch", type=int, default=5,
+                        help="Minimum desired batch size for auto mode (default: 5)")
+    parser.add_argument("--auto_cache", type=str, default=None,
+                        help="Optional JSON file path to store auto-tuning cache keyed by model and resolution")
     parser.add_argument("--model", type=str, default="seedvr2_ema_3b_fp8_e4m3fn.safetensors",
                         choices=[
                             "seedvr2_ema_3b_fp16.safetensors",
-                            "seedvr2_ema_3b_fp8_e4m3fn.safetensors", 
+                            "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
                             "seedvr2_ema_7b_fp16.safetensors",
                             "seedvr2_ema_7b_fp8_e4m3fn.safetensors"
                         ],
@@ -478,6 +847,8 @@ def parse_arguments():
     if platform.system() != "Darwin":
         parser.add_argument("--cuda_device", type=str, default=None,
                         help="CUDA device id(s). Single id (e.g., '0') or comma-separated list '0,1' for multi-GPU")
+    parser.add_argument("--enable_blockswap", action="store_true",
+                        help="Allow auto-tuner to enable BlockSwap for additional VRAM headroom")
     parser.add_argument("--blocks_to_swap", type=int, default=0,
                         help="Number of blocks to swap for VRAM optimization (default: 0, disabled), up to 32 for 3B model, 36 for 7B")
     parser.add_argument("--use_none_blocking", action="store_true",
@@ -504,26 +875,29 @@ def main():
     # Parse arguments
     args = parse_arguments()
     debug.enabled = args.debug
-    
-    debug.log("Arguments:", category="setup")
-    for key, value in vars(args).items():
-        debug.log(f"  {key}: {value}", category="none")
 
-    if args.vae_tiling_enabled and (args.vae_tile_overlap[0] >= args.vae_tile_size[0] or args.vae_tile_overlap[1] >= args.vae_tile_size[1]):
-        print(f"Error: VAE tile overlap {args.vae_tile_overlap} must be smaller than tile size {args.vae_tile_size}")
-        sys.exit(1)
-    
-    if args.debug:
-        if platform.system() == "Darwin":
-            print("You are running on macOS and will use the MPS backend!")
-        else:
-            # Show actual CUDA device visibility
-            debug.log(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set (all)')}", category="device")
-            if torch.cuda.is_available():
-                debug.log(f"torch.cuda.device_count(): {torch.cuda.device_count()}", category="device")
-                debug.log(f"Using device index 0 inside script (mapped to selected GPU)", category="device")
-    
     try:
+        if args.auto:
+            auto_tune(args, get_video_metadata(args.video_path))
+
+        debug.log("Arguments:", category="setup")
+        for key, value in vars(args).items():
+            debug.log(f"  {key}: {value}", category="none")
+
+        if args.vae_tiling_enabled and (args.vae_tile_overlap[0] >= args.vae_tile_size[0] or args.vae_tile_overlap[1] >= args.vae_tile_size[1]):
+            print(f"Error: VAE tile overlap {args.vae_tile_overlap} must be smaller than tile size {args.vae_tile_size}")
+            sys.exit(1)
+
+        if args.debug:
+            if platform.system() == "Darwin":
+                print("You are running on macOS and will use the MPS backend!")
+            else:
+                # Show actual CUDA device visibility
+                debug.log(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set (all)')}", category="device")
+                if torch.cuda.is_available():
+                    debug.log(f"torch.cuda.device_count(): {torch.cuda.device_count()}", category="device")
+                    debug.log(f"Using device index 0 inside script (mapped to selected GPU)", category="device")
+
         # Ensure --output is a directory when using PNG format
         if args.output_format == "png":
             output_path_obj = Path(args.output)
