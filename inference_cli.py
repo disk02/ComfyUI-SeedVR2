@@ -937,7 +937,10 @@ def main():
 
         est_h, est_w = estimate_output_frame_shape(meta, args.resolution)
         est_bytes = est_h * est_w * 3 * 2 * chunk_size
-        print(f"[INFO] Estimated RAM per chunk ≈ {est_bytes / (1024 ** 2):.1f} MiB")
+        print(
+            f"[INFO] Approx. RAM per chunk (frame buffers only) ≈ {est_bytes / (1024 ** 2):.1f} MiB "
+            f"(excludes activations/overlap; fp16, {est_w}x{est_h}x3)"
+        )
 
         chunk_iter = extract_frame_chunks(
             args.video_path,
@@ -1006,7 +1009,7 @@ def main():
                 if chunk_index > 0 and overlap > 0 and prev_output_tail is not None:
                     seam = apply_temporal_overlap_blending(
                         prev_output_tail,
-                        args.batch_size,
+                        0,  # batch_size is unused in seam mode; pass 0 for clarity
                         overlap,
                         next_frames=result_chunk[:overlap],
                     )
