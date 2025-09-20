@@ -242,7 +242,9 @@ def generation_step(runner, text_embeds_dict, preserve_vram, cond_latents, tempo
 
     # Use adaptive autocast for optimal performance
     with torch.no_grad():
-        with torch.autocast(str(get_device()), autocast_dtype, enabled=True):
+        dev = get_device()
+        # torch.autocast requires the device type string (e.g., 'cuda', 'cpu', 'mps').
+        with torch.autocast(dev.type, autocast_dtype, enabled=True):
             video_tensors = runner.inference(
                 noises=noises,
                 conditions=conditions,
