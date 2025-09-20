@@ -9,8 +9,21 @@ Migration en cours...
 """
 
 # 🆕 TENTATIVE: Nouvelle architecture modulaire
-from .src.interfaces.comfyui_node import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
-USING_MODULAR = True
+NODE_CLASS_MAPPINGS = {}
+NODE_DISPLAY_NAME_MAPPINGS = {}
+USING_MODULAR = False
+
+try:
+    from .src.interfaces.comfyui_node import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS  # type: ignore[assignment]
+except ImportError:  # pragma: no cover - fallback for direct package execution
+    try:
+        from src.interfaces.comfyui_node import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS  # type: ignore[assignment]
+    except ImportError:
+        USING_MODULAR = False
+    else:
+        USING_MODULAR = True
+else:
+    USING_MODULAR = True
 
 
 # Export pour ComfyUI

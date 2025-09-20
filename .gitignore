@@ -1,6 +1,7 @@
 .git/*
 **/__pycache__/
-tests/
+tests/*
+!tests/test_device_selection.py
 .vscode/
 .cursor/
 benchmark/
@@ -16,6 +17,7 @@ README_*.md
 run_*.py
 vram_diagnostic.py
 test_*.py
+!tests/test_device_selection.py
 VRAM_OPTIMIZATIONS_SUMMARY.md
 seedvr2.py
 src/core/isolated_generation.py

@@ -76,7 +76,7 @@ def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any], debug) ->
         model = model.dit_model
     
     # Determine devices
-    device = str(get_device()) if (torch.cuda.is_available() or torch.mps.is_available()) else "cpu"
+    device = str(get_device())
     offload_device = "cpu"
 
     configs = []

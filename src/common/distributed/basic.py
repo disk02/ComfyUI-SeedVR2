@@ -12,12 +12,12 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
-"""
-Distributed basic functions.
-"""
+"""Distributed basic functions with safe device detection."""
 
 import os
+import platform
 from datetime import timedelta
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
@@ -43,13 +43,30 @@ def get_world_size() -> int:
     return int(os.environ.get("WORLD_SIZE", "1"))
 
 
+def has_mps() -> bool:
+    """Safe MPS availability check."""
+    if platform.system() != "Darwin":
+        return False
+    if not hasattr(torch, "mps"):
+        return False
+    try:
+        return hasattr(torch.mps, "is_available") and torch.mps.is_available()
+    except Exception:
+        return False
+
+
 def get_device() -> torch.device:
-    """
-    Get current rank device.
-    """
-    if torch.mps.is_available():
-        return "mps"
-    return torch.device("cuda", get_local_rank())
+    """Get a safe, platform-aware device for the current process."""
+    if torch.cuda.is_available():
+        try:
+            return torch.device("cuda", get_local_rank())
+        except Exception:
+            return torch.device("cuda")
+
+    if has_mps():
+        return torch.device("mps")
+
+    return torch.device("cpu")
 
 
 def barrier_if_distributed(*args, **kwargs):
@@ -67,7 +84,8 @@ def init_torch(cudnn_benchmark=True, timeout=timedelta(seconds=600)):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = cudnn_benchmark
-    torch.cuda.set_device(get_local_rank())
+    if torch.cuda.is_available():
+        torch.cuda.set_device(get_local_rank())
     dist.init_process_group(
         backend="nccl",
         rank=get_global_rank(),

@@ -33,7 +33,7 @@ from src.optimization.compatibility import FP8CompatibleDiT
 from src.common.config import load_config, create_object
 from src.core.infer import VideoDiffusionInfer
 from src.optimization.blockswap import apply_block_swap_to_dit
-from src.common.distributed import get_device
+from src.common.distributed import get_device, has_mps
 from src.optimization.blockswap import cleanup_blockswap
 
 # Get script directory for config paths
@@ -167,9 +167,6 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None,
     
     # Set device
     device = str(get_device())
-    #if torch.mps.is_available():
-    #    device = "mps"
-    
     # Configure models
     dit_checkpoint_path = os.path.join(base_cache_dir, f'./{model}')
     debug.start_timer("dit_model_infer")
@@ -180,15 +177,15 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None,
     debug.log_memory_state("After DiT model configuration", detailed_tensors=False)
 
     # Set VAE dtype for MPS compatibility
-    if torch.mps.is_available():
+    if has_mps():
         original_vae_dtype = config.vae.dtype
         config.vae.dtype = "bfloat16"
-        debug.log(f"MPS detected: Setting VAE dtype from {original_vae_dtype} to {config.vae.dtype} for compatibility", 
+        debug.log(f"MPS detected: Setting VAE dtype from {original_vae_dtype} to {config.vae.dtype} for compatibility",
                     category="precision", force=True)
     
     debug.start_timer("vae_model_infer")
     vae_checkpoint_path = os.path.join(base_cache_dir, f'./{config.vae.checkpoint}')
-    vae_override_dtype = getattr(torch, config.vae.dtype) if torch.mps.is_available() else None
+    vae_override_dtype = getattr(torch, config.vae.dtype) if has_mps() else None
     runner = configure_model_inference(runner, "vae", device, vae_checkpoint_path, config,
                                    preserve_vram, debug=debug, override_dtype=vae_override_dtype)
     debug.log(f"VAE downsample factors configured (spatial: {spatial_downsample_factor}x, temporal: {temporal_downsample_factor}x)", category="vae")
