@@ -298,6 +298,7 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
     model_name = shared_args["model"]
     # ensure model weights present (each process checks but very fast if already downloaded)
     worker_debug.log(f"Configuring runner for device {device_id}", category="setup")
+    # BlockSwap wiring: nightly expects config here (configure_runner), not generation_loop.
     runner = configure_runner(model_name, model_dir, shared_args["preserve_vram"], worker_debug, block_swap_config=shared_args["block_swap_config"], vae_tiling_enabled=shared_args["vae_tiling_enabled"], vae_tile_size=shared_args["vae_tile_size"], vae_tile_overlap=shared_args["vae_tile_overlap"])
 
     # Run generation
@@ -311,8 +312,6 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
         preserve_vram=shared_args["preserve_vram"],
         temporal_overlap=shared_args["temporal_overlap"],
         debug=worker_debug,
-        block_swap_config=shared_args["block_swap_config"]
-
     )
 
     # Send back result as numpy array to avoid CUDA transfers
