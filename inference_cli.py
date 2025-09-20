@@ -502,7 +502,7 @@ def parse_arguments():
     
     parser.add_argument("--video_path", type=str, required=True,
                         help="Path to input video file")
-    parser.add_argument("--seed", type=int, default=666,
+    parser.add_argument("--seed", type=int, default=333,
                         help="Random seed for reproducibility (default: 666). Use -1 for a random seed each run.")
     parser.add_argument("--resolution", type=int, default=1072,
                         help="Target resolution of the short side (default: 1072)")
