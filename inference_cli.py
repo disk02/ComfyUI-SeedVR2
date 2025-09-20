@@ -322,8 +322,62 @@ def _gpu_processing(frames_tensor, device_list, args):
     """Split frames and process them in parallel on multiple GPUs."""
     num_devices = len(device_list)
     total_frames = frames_tensor.shape[0]
-    
-    # Create overlapping chunks (for multi GPU); ensures every chunk is 
+
+    # === FAST PATH: single GPU, avoid multiprocessing & large IPC transfers ===
+    if num_devices == 1:
+        device_id = device_list[0]
+
+        import os  # Local import to mirror worker process environment setup
+        import torch
+
+        if torch.cuda.is_available():
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+
+        from src.core.model_manager import configure_runner
+        from src.core.generation import generation_loop
+        from src.utils.debug import Debug
+
+        worker_debug = Debug(enabled=getattr(args, "debug", False))
+
+        frames_local = frames_tensor.to(torch.float16)
+
+        block_swap_config = None
+        if getattr(args, "blocks_to_swap", 0):
+            block_swap_config = {
+                "blocks_to_swap": int(args.blocks_to_swap),
+                "offload_io_components": bool(getattr(args, "offload_io_components", False)),
+                "use_none_blocking": bool(getattr(args, "use_none_blocking", False)),
+                "cache_model": False,
+            }
+
+        model_dir = args.model_dir if args.model_dir is not None else "./models/SEEDVR2"
+
+        runner = configure_runner(
+            args.model,
+            model_dir,
+            args.preserve_vram,
+            worker_debug,
+            block_swap_config=block_swap_config,
+            vae_tiling_enabled=args.vae_tiling_enabled,
+            vae_tile_size=args.vae_tile_size,
+            vae_tile_overlap=args.vae_tile_overlap,
+        )
+
+        result_tensor = generation_loop(
+            runner=runner,
+            images=frames_local,
+            cfg_scale=1.0,
+            seed=args.seed,
+            res_w=args.resolution,
+            batch_size=args.batch_size,
+            preserve_vram=args.preserve_vram,
+            temporal_overlap=args.temporal_overlap,
+            debug=worker_debug,
+        )
+        return result_tensor.detach().to("cpu", dtype=torch.float16)
+
+    # Create overlapping chunks (for multi GPU); ensures every chunk is
     # a multiple of batch_size (except last one) to avoid blending issues
     if args.temporal_overlap > 0 and num_devices > 1:
         chunk_with_overlap = total_frames // num_devices + args.temporal_overlap
