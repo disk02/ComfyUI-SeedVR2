@@ -48,6 +48,141 @@ from pathlib import Path
 from src.utils.downloads import download_weight
 from src.utils.debug import Debug
 
+
+_RUNNER_CACHE: Dict[Tuple[Any, ...], Any] = {}
+
+
+def _ensure_tuple(value: Any) -> Tuple[int, ...]:
+    if isinstance(value, (list, tuple)):
+        return tuple(int(v) for v in value)
+    if value is None:
+        return tuple()
+    return (int(value),)
+
+
+def get_or_create_runner(args, debug_obj):
+    """Cache and return an inference runner keyed by critical CLI arguments."""
+    key = (
+        args.model,
+        args.cuda_device if hasattr(args, "cuda_device") else None,
+        bool(getattr(args, "preserve_vram", False)),
+        _ensure_tuple(getattr(args, "vae_tile_size", (0, 0))),
+        _ensure_tuple(getattr(args, "vae_tile_overlap", (0, 0))),
+        bool(getattr(args, "vae_tiling_enabled", False)),
+        int(getattr(args, "blocks_to_swap", 0)),
+        bool(getattr(args, "offload_io_components", False)),
+        bool(getattr(args, "use_none_blocking", True)),
+    )
+
+    if key in _RUNNER_CACHE:
+        return _RUNNER_CACHE[key]
+
+    from src.core.model_manager import configure_runner
+
+    bs_cfg = None
+    if getattr(args, "blocks_to_swap", 0):
+        bs_cfg = {
+            "blocks_to_swap": int(args.blocks_to_swap),
+            "offload_io_components": bool(getattr(args, "offload_io_components", False)),
+            "use_none_blocking": bool(getattr(args, "use_none_blocking", True)),
+            "cache_model": False,
+            "debug": bool(getattr(args, "debug_blockswap", False)),
+        }
+
+    model_dir = args.model_dir if getattr(args, "model_dir", None) else "./models/SEEDVR2"
+
+    runner = configure_runner(
+        args.model,
+        model_dir,
+        getattr(args, "preserve_vram", False),
+        debug_obj,
+        block_swap_config=bs_cfg,
+        vae_tiling_enabled=getattr(args, "vae_tiling_enabled", False),
+        vae_tile_size=getattr(args, "vae_tile_size", 0),
+        vae_tile_overlap=getattr(args, "vae_tile_overlap", 0),
+    )
+    _RUNNER_CACHE[key] = runner
+    return runner
+
+
+def snap_to_4n_plus_1(x: int) -> int:
+    """Return the nearest lower 4n+1 value (minimum 1)."""
+    if x <= 1:
+        return 1
+    remainder = (x - 1) % 4
+    return x - remainder
+
+
+def _generation_with_runner(runner, model_in: torch.Tensor, batch_size: int, args, debug_obj):
+    from src.core.generation import generation_loop
+
+    effective_batch = max(1, int(batch_size))
+    model_in = model_in.to(torch.float16)
+    return generation_loop(
+        runner=runner,
+        images=model_in,
+        cfg_scale=1.0,
+        seed=args.seed,
+        res_w=args.resolution,
+        batch_size=effective_batch,
+        preserve_vram=getattr(args, "preserve_vram", False),
+        temporal_overlap=getattr(args, "temporal_overlap", 0),
+        debug=debug_obj,
+    ).detach().to("cpu", dtype=torch.float16)
+
+
+def run_chunk_with_retry(runner, model_in: torch.Tensor, args, debug_obj):
+    import torch
+
+    batch_size = max(1, int(getattr(args, "batch_size", 1)))
+    try:
+        return _generation_with_runner(runner, model_in, batch_size, args, debug_obj)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "CUDA out of memory" not in message:
+            raise
+
+        new_bs = max(1, snap_to_4n_plus_1(batch_size // 2))
+        if new_bs == batch_size:
+            raise
+
+        print(f"[WARN] CUDA OOM with batch_size={batch_size}. Retrying once with batch_size={new_bs}.")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        args.batch_size = new_bs
+        return _generation_with_runner(runner, model_in, new_bs, args, debug_obj)
+
+
+def estimate_output_frame_shape(meta: Dict[str, Any], target_resolution: int) -> Tuple[int, int]:
+    """Estimate output (height, width) based on metadata and target short-side resolution."""
+    width = meta.get("width") if meta else None
+    height = meta.get("height") if meta else None
+
+    if width and height and width > 0 and height > 0 and target_resolution and target_resolution > 0:
+        short_side = min(width, height)
+        scale = target_resolution / float(short_side) if short_side > 0 else 1.0
+        out_w = max(1, int(round(width * scale)))
+        out_h = max(1, int(round(height * scale)))
+        return out_h, out_w
+
+    if width and height and width > 0 and height > 0:
+        return int(height), int(width)
+
+    fallback = max(1, int(target_resolution)) if target_resolution and target_resolution > 0 else 512
+    return fallback, fallback
+
+
+def write_png_chunk(frames_uint8_rgb: np.ndarray, out_dir: str, start_idx: int) -> None:
+    if frames_uint8_rgb.size == 0:
+        return
+
+    import imageio.v3 as iio
+
+    os.makedirs(out_dir, exist_ok=True)
+    for offset, frame in enumerate(frames_uint8_rgb):
+        filename = os.path.join(out_dir, f"{start_idx + offset:06d}.png")
+        iio.imwrite(filename, frame)
+
 debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
 
 
@@ -172,12 +307,20 @@ def _build_prepend_context(frames: torch.Tensor, count: int) -> Tuple[torch.Tens
     return context, context.shape[0]
 
 
-def open_video_writer(meta: Dict[str, Any], output_path: str, frame_shape: Tuple[int, int]) -> Tuple[cv2.VideoWriter, Tuple[int, int], float]:
+def open_video_writer(
+    meta: Dict[str, Any],
+    output_path: str,
+    frame_shape: Tuple[int, int],
+    fps_override: Optional[float] = None,
+) -> Tuple[cv2.VideoWriter, Tuple[int, int], float]:
     """Open a cv2.VideoWriter using probed metadata and the frame shape."""
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    fps = float(meta.get("fps")) if meta.get("fps") else 30.0
+    if fps_override is not None:
+        fps = float(fps_override)
+    else:
+        fps = float(meta.get("fps")) if meta.get("fps") else 30.0
     height, width = frame_shape
     writer = cv2.VideoWriter(output_path, fourcc, fps, (int(width), int(height)))
     if not writer.isOpened():
@@ -508,48 +651,17 @@ def _gpu_processing(frames_tensor, device_list, args):
             os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
             os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
-        from src.core.model_manager import configure_runner
-        from src.core.generation import generation_loop
         from src.utils.debug import Debug
 
         worker_debug = Debug(enabled=getattr(args, "debug", False))
 
+        runner = get_or_create_runner(args, worker_debug)
+
         frames_local = frames_tensor.to(torch.float16)
+        if frames_local.device.type == "cpu" and torch.cuda.is_available():
+            frames_local = frames_local.pin_memory()
 
-        block_swap_config = None
-        if getattr(args, "blocks_to_swap", 0):
-            block_swap_config = {
-                "blocks_to_swap": int(args.blocks_to_swap),
-                "offload_io_components": bool(getattr(args, "offload_io_components", False)),
-                "use_none_blocking": bool(getattr(args, "use_none_blocking", False)),
-                "cache_model": False,
-            }
-
-        model_dir = args.model_dir if args.model_dir is not None else "./models/SEEDVR2"
-
-        runner = configure_runner(
-            args.model,
-            model_dir,
-            args.preserve_vram,
-            worker_debug,
-            block_swap_config=block_swap_config,
-            vae_tiling_enabled=args.vae_tiling_enabled,
-            vae_tile_size=args.vae_tile_size,
-            vae_tile_overlap=args.vae_tile_overlap,
-        )
-
-        result_tensor = generation_loop(
-            runner=runner,
-            images=frames_local,
-            cfg_scale=1.0,
-            seed=args.seed,
-            res_w=args.resolution,
-            batch_size=args.batch_size,
-            preserve_vram=args.preserve_vram,
-            temporal_overlap=args.temporal_overlap,
-            debug=worker_debug,
-        )
-        return result_tensor.detach().to("cpu", dtype=torch.float16)
+        return run_chunk_with_retry(runner, frames_local, args, worker_debug)
 
     # Create overlapping chunks (for multi GPU); ensures every chunk is
     # a multiple of batch_size (except last one) to avoid blending issues
@@ -695,6 +807,8 @@ def parse_arguments():
                         help="Skip the first frames during processing")
     parser.add_argument("--load_cap", type=int, default=0,
                         help="Maximum frames in RAM at once; video is processed in multiple chunks until EOF.")
+    parser.add_argument("--fps", type=float, default=None,
+                        help="Override output FPS; defaults to the probed source FPS when unset.")
     parser.add_argument("--output", type=str, default=None,
                         help="Output path (default: auto-generated, if output_format is png, it will be a directory)")
     parser.add_argument("--output_format", type=str, default="video", choices=["video", "png"],
@@ -809,179 +923,156 @@ def main():
 
         total_start = time.time()
 
-        if args.output_format == "png":
-            debug.log(f"Extracting frames from video...", category="generation")
-            extraction_start = time.time()
-            frames_tensor, original_fps = extract_frames_from_video(
-                args.video_path,
-                args.skip_first_frames,
-                args.load_cap,
-                args.prepend_frames
-            )
-            debug.log(f"Frame extraction time: {time.time() - extraction_start:.2f}s", category="timing")
+        if len(device_list) != 1:
+            raise RuntimeError("Chunked streaming currently supports single-GPU execution only.")
 
-            processing_start = time.time()
-            download_weight(args.model, args.model_dir)
-            result = _gpu_processing(frames_tensor, device_list, args)
-            generation_time = time.time() - processing_start
+        if platform.system() == "Windows":
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
-            debug.log(f"Generation time: {generation_time:.2f}s", category="timing")
-            if platform.system() != "Darwin":
-                debug.log(f"Peak VRAM usage: {torch.cuda.max_memory_allocated() / 1024**3:.2f}GB", category="memory")
+        download_weight(args.model, args.model_dir)
 
-            if args.temporal_overlap > 0:
-                debug.log(f"Applying temporal overlap with blending", category="generation")
-                result = apply_temporal_overlap_blending(result, args.batch_size, args.temporal_overlap)
-            debug.log(f"Result shape: {result.shape}, dtype: {result.dtype}", category="memory")
+        chunk_size = int(args.load_cap) if args.load_cap and args.load_cap > 0 else 1000
+        if chunk_size <= 0:
+            chunk_size = 1000
 
-            if args.prepend_frames > 0:
-                debug.log(f"Removing prepended ({args.prepend_frames}) frames from the results)", category="generation")
-                result = result[args.prepend_frames:]
-                debug.log(f"Result shape after removing prepended frames: {result.shape}", category="info")
+        est_h, est_w = estimate_output_frame_shape(meta, args.resolution)
+        est_bytes = est_h * est_w * 3 * 2 * chunk_size
+        print(f"[INFO] Estimated RAM per chunk ≈ {est_bytes / (1024 ** 2):.1f} MiB")
 
-            output_dir = args.output
-            base_name = Path(args.video_path).stem + "_upscaled"
-            debug.log(f"Saving PNG frames to directory: {output_dir}", category="file")
+        chunk_iter = extract_frame_chunks(
+            args.video_path,
+            chunk_size=chunk_size,
+            skip_first=args.skip_first_frames,
+            dtype=torch.float16,
+        )
 
-            save_start = time.time()
-            save_frames_to_png(result, output_dir, base_name)
-            debug.log(f"Save time: {time.time() - save_start:.2f}s", category="timing")
+        writer: Optional[cv2.VideoWriter] = None
+        writer_fps = float(args.fps) if getattr(args, "fps", None) else (float(meta.get("fps")) if meta.get("fps") else 30.0)
+        total_decoded = 0
+        total_written = 0
+        prev_input_tail: Optional[torch.Tensor] = None
+        prev_output_tail: Optional[torch.Tensor] = None
+        chunk_index = 0
+        generation_time_total = 0.0
+        applied_prepend = 0
+        chunks_seen = 0
 
-            total_time = time.time() - total_start
-            debug.log(f"Upscaling completed successfully!", category="success", force=True)
-            debug.log(f"PNG frames saved in directory: {args.output}", category="file", force=True)
-            debug.log(f"Total processing time: {total_time:.2f}s", category="timing", force=True)
-            debug.log(f"Average FPS: {len(frames_tensor) / generation_time:.2f} frames/sec", category="timing", force=True)
-        else:
-            if len(device_list) != 1:
-                raise RuntimeError("Chunked streaming currently supports single-GPU execution only.")
+        runner = get_or_create_runner(args, debug)
 
-            download_weight(args.model, args.model_dir)
+        try:
+            for chunk in chunk_iter:
+                chunks_seen += 1
+                start_idx = int(chunk["start_idx"])
+                raw_tensor = chunk["tensor"].to(torch.float16)
+                raw_count = int(chunk["raw_count"])
+                is_last = bool(chunk["is_last"])
+                total_decoded += raw_count
 
-            chunk_size = int(args.load_cap) if args.load_cap and args.load_cap > 0 else 1000
-            if chunk_size <= 0:
-                chunk_size = 1000
+                overlap = max(int(getattr(args, "temporal_overlap", 0) or 0), 0)
+                if raw_count < overlap:
+                    print(f"[WARN] Reducing temporal overlap {overlap}->{raw_count} at chunk start={start_idx}")
+                    overlap = raw_count
 
-            chunk_iter = extract_frame_chunks(
-                args.video_path,
-                chunk_size=chunk_size,
-                skip_first=args.skip_first_frames,
-                dtype=torch.float16,
-            )
+                model_input = raw_tensor
+                if chunk_index == 0 and args.prepend_frames > 0:
+                    prepend_tensor, applied_prepend = _build_prepend_context(raw_tensor, args.prepend_frames)
+                    if applied_prepend < args.prepend_frames:
+                        print(
+                            f"[WARN] Requested prepend {args.prepend_frames} reduced to {applied_prepend} based on available frames"
+                        )
+                    if applied_prepend > 0:
+                        model_input = torch.cat([prepend_tensor, model_input], dim=0)
 
-            writer = None
-            writer_fps = float(meta.get("fps")) if meta.get("fps") else 30.0
-            total_decoded = 0
-            total_written = 0
-            prev_input_tail = None
-            prev_output_tail = None
-            chunk_index = 0
-            generation_time_total = 0.0
-            applied_prepend = 0
-            chunks_seen = 0
+                if chunk_index > 0 and overlap > 0 and prev_input_tail is not None:
+                    model_input = torch.cat([prev_input_tail, model_input], dim=0)
 
-            try:
-                for chunk in chunk_iter:
-                    chunks_seen += 1
-                    start_idx = int(chunk["start_idx"])
-                    raw_tensor = chunk["tensor"].to(torch.float16)
-                    raw_count = int(chunk["raw_count"])
-                    is_last = bool(chunk["is_last"])
-                    total_decoded += raw_count
+                model_input = model_input.contiguous()
+                if model_input.device.type == "cpu" and torch.cuda.is_available():
+                    model_input = model_input.pin_memory()
 
-                    overlap = max(int(getattr(args, "temporal_overlap", 0) or 0), 0)
-                    if raw_count < overlap:
-                        print(f"[WARN] Reducing temporal overlap {overlap}->{raw_count} at chunk start={start_idx}")
-                        overlap = raw_count
+                valid_frames = model_input.shape[0]
 
-                    model_input = raw_tensor
-                    if chunk_index == 0 and args.prepend_frames > 0:
-                        prepend_tensor, applied_prepend = _build_prepend_context(raw_tensor, args.prepend_frames)
-                        if applied_prepend < args.prepend_frames:
-                            print(
-                                f"[WARN] Requested prepend {args.prepend_frames} reduced to {applied_prepend} based on available frames"
-                            )
-                        if applied_prepend > 0:
-                            model_input = torch.cat([prepend_tensor, model_input], dim=0)
+                chunk_start = time.time()
+                result_chunk = run_chunk_with_retry(runner, model_input, args, debug)
+                generation_time_total += time.time() - chunk_start
 
-                    if chunk_index > 0 and overlap > 0 and prev_input_tail is not None:
-                        model_input = torch.cat([prev_input_tail, model_input], dim=0)
+                if result_chunk.shape[0] != valid_frames:
+                    result_chunk = result_chunk[:valid_frames]
 
-                    valid_frames = model_input.shape[0]
+                tensor_to_write = result_chunk
+                if chunk_index == 0 and applied_prepend > 0:
+                    tensor_to_write = tensor_to_write[applied_prepend:]
 
-                    chunk_start = time.time()
-                    result_chunk = _gpu_processing(model_input, device_list, args)
-                    generation_time_total += time.time() - chunk_start
-
-                    if result_chunk.shape[0] != valid_frames:
-                        result_chunk = result_chunk[:valid_frames]
-
-                    tensor_to_write = result_chunk
-                    if chunk_index == 0 and applied_prepend > 0:
-                        tensor_to_write = tensor_to_write[applied_prepend:]
-
-                    if chunk_index > 0 and overlap > 0 and prev_output_tail is not None:
-                        seam = apply_temporal_overlap_blending(prev_output_tail, args.batch_size, overlap, next_frames=result_chunk[:overlap])
-                        remainder = result_chunk[overlap:]
-                        tensor_to_write = torch.cat([seam, remainder], dim=0)
-
-                    tensor_to_write = tensor_to_write.contiguous()
-
-                    if tensor_to_write.numel() == 0:
-                        prev_input_tail = raw_tensor[-overlap:].clone() if overlap > 0 else None
-                        prev_output_tail = tensor_to_write[-overlap:].clone() if overlap > 0 else None
-                        chunk_index += 1
-                        continue
-
-                    frames_uint8 = (
-                        tensor_to_write.clamp(0, 1).mul(255.0).to(torch.uint8).cpu().numpy()
+                if chunk_index > 0 and overlap > 0 and prev_output_tail is not None:
+                    seam = apply_temporal_overlap_blending(
+                        prev_output_tail,
+                        args.batch_size,
+                        overlap,
+                        next_frames=result_chunk[:overlap],
                     )
+                    remainder = result_chunk[overlap:]
+                    tensor_to_write = torch.cat([seam, remainder], dim=0)
 
+                tensor_to_write = tensor_to_write.contiguous()
+
+                if tensor_to_write.shape[0] == 0:
+                    prev_input_tail = raw_tensor[-overlap:] if overlap > 0 else None
+                    prev_output_tail = result_chunk[-overlap:] if overlap > 0 else None
+                    chunk_index += 1
+                    continue
+
+                frames_uint8 = tensor_to_write.clamp(0, 1).mul(255.0).to(torch.uint8).cpu().numpy()
+
+                if args.output_format == "video":
                     if writer is None:
                         writer, _, writer_fps = open_video_writer(
                             meta,
                             args.output,
-                            (frames_uint8.shape[1], frames_uint8.shape[2]),
+                            (tensor_to_write.shape[1], tensor_to_write.shape[2]),
+                            fps_override=getattr(args, "fps", None),
                         )
-
                     write_video_frames(writer, frames_uint8)
-                    total_written += tensor_to_write.shape[0]
+                else:
+                    write_png_chunk(frames_uint8, args.output, total_written)
 
-                    prev_input_tail = raw_tensor[-overlap:].clone() if overlap > 0 else None
-                    if overlap > 0:
-                        prev_output_tail = tensor_to_write[-overlap:].clone()
-                    else:
-                        prev_output_tail = None
+                total_written += tensor_to_write.shape[0]
 
-                    print(
-                        f"[CHUNK] {chunk_index} start={start_idx} dec={raw_count} "
-                        f"wrote={tensor_to_write.shape[0]} last={is_last}"
-                    )
-
-                    chunk_index += 1
-
-                if chunks_seen == 0:
-                    raise RuntimeError("No frames decoded from the input video.")
-
-                if total_written == 0:
-                    raise RuntimeError("No frames were written to the output video.")
+                prev_input_tail = raw_tensor[-overlap:] if overlap > 0 else None
+                prev_output_tail = tensor_to_write[-overlap:] if overlap > 0 else None
 
                 print(
-                    f"[SUMMARY] decoded={total_decoded} written={total_written} (fps={writer_fps})"
+                    f"[CHUNK] {chunk_index} start={start_idx} dec={raw_count} "
+                    f"wrote={tensor_to_write.shape[0]} last={is_last}"
                 )
 
-            finally:
-                close_video_writer(writer)
+                chunk_index += 1
 
-            total_time = time.time() - total_start
-            debug.log(f"Upscaling completed successfully!", category="success", force=True)
-            debug.log(f"Output saved to video: {args.output}", category="file", force=True)
-            debug.log(f"Total processing time: {total_time:.2f}s", category="timing", force=True)
-            if generation_time_total > 0:
-                avg_fps = total_written / generation_time_total
-                debug.log(f"Average FPS: {avg_fps:.2f} frames/sec", category="timing", force=True)
+            if chunks_seen == 0:
+                raise RuntimeError("No frames decoded from the input video.")
+
+            if total_written == 0:
+                raise RuntimeError("No frames were written to the output destination.")
+
+            if args.output_format == "video":
+                print(f"[SUMMARY] decoded={total_decoded} written={total_written} (fps={writer_fps})")
             else:
-                debug.log("Average FPS: n/a", category="timing", force=True)
+                print(f"[SUMMARY] decoded={total_decoded} written={total_written} (png)")
+
+        finally:
+            close_video_writer(writer)
+
+        total_time = time.time() - total_start
+        debug.log(f"Upscaling completed successfully!", category="success", force=True)
+        if args.output_format == "video":
+            debug.log(f"Output saved to video: {args.output}", category="file", force=True)
+        else:
+            debug.log(f"PNG frames saved in directory: {args.output}", category="file", force=True)
+        debug.log(f"Total processing time: {total_time:.2f}s", category="timing", force=True)
+        if generation_time_total > 0:
+            avg_fps = total_written / generation_time_total
+            debug.log(f"Average FPS: {avg_fps:.2f} frames/sec", category="timing", force=True)
+        else:
+            debug.log("Average FPS: n/a", category="timing", force=True)
 
     except Exception as e:
         debug.log(f"Error during processing: {e}", level="ERROR", category="generation", force=True)
