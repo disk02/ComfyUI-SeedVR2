@@ -10,6 +10,7 @@ import time
 import platform
 import random
 import multiprocessing as mp
+from typing import Any, Dict, Iterator, Optional
 
 # Set up path before any other imports to fix module resolution
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +49,101 @@ from src.utils.downloads import download_weight
 from src.utils.debug import Debug
 
 debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
+
+
+def probe_video_meta(path: str) -> Dict[str, Optional[Any]]:
+    """Probe basic video metadata using OpenCV."""
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video for probing: {path}")
+
+    try:
+        fps_raw = cap.get(cv2.CAP_PROP_FPS)
+        fps = float(fps_raw) if fps_raw and fps_raw > 0 else None
+
+        total_raw = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        total_frames = int(total_raw) if total_raw and total_raw > 0 else None
+
+        width_raw = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        width = int(width_raw) if width_raw and width_raw > 0 else None
+
+        height_raw = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        height = int(height_raw) if height_raw and height_raw > 0 else None
+    finally:
+        cap.release()
+
+    return {
+        "fps": fps,
+        "total_frames": total_frames,
+        "width": width,
+        "height": height,
+        "pix_fmt": None,
+    }
+
+
+def extract_frame_chunks(
+    video_path: str,
+    chunk_size: int,
+    skip_first: int = 0,
+    dtype: torch.dtype = torch.float16,
+) -> Iterator[Dict[str, Any]]:
+    """Stream frames from a video in bounded fp16 chunks.
+
+    Yields dictionaries containing:
+        - "start_idx": Global index of the first frame in the chunk (0-based).
+        - "tensor": Torch tensor with shape [T, H, W, C] normalized to [0, 1].
+        - "raw_count": Number of decoded frames contained in the chunk.
+        - "is_last": True when the end of the file has been reached after this chunk.
+    """
+    if dtype != torch.float16:
+        raise ValueError("extract_frame_chunks currently supports torch.float16 output only.")
+
+    if chunk_size is None or chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive; got {chunk_size}")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
+
+    if skip_first and skip_first > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(skip_first))
+
+    start_idx = int(skip_first) if skip_first else 0
+    frames_rgb_fp16 = []
+
+    try:
+        while True:
+            frames_rgb_fp16.clear()
+            eof = False
+
+            while len(frames_rgb_fp16) < chunk_size:
+                ok, bgr = cap.read()
+                if not ok:
+                    eof = True
+                    break
+
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                rgb_fp16 = rgb.astype(np.float16) / np.float16(255.0)
+                frames_rgb_fp16.append(rgb_fp16)
+
+            if not frames_rgb_fp16:
+                break
+
+            chunk_np = np.stack(frames_rgb_fp16, axis=0)
+            chunk_t = torch.from_numpy(chunk_np).to(dtype)
+
+            yield {
+                "start_idx": start_idx,
+                "tensor": chunk_t,
+                "raw_count": int(chunk_t.shape[0]),
+                "is_last": eof,
+            }
+
+            start_idx += int(chunk_t.shape[0])
+            if eof:
+                break
+    finally:
+        cap.release()
 
 
 def extract_frames_from_video(video_path, skip_first_frames=0, load_cap=None, prepend_frames=0):
@@ -521,7 +617,7 @@ def parse_arguments():
     parser.add_argument("--skip_first_frames", type=int, default=0,
                         help="Skip the first frames during processing")
     parser.add_argument("--load_cap", type=int, default=0,
-                        help="Maximum number of frames to load from video (default: load all)")
+                        help="Maximum frames in RAM at once; video is processed in multiple chunks until EOF.")
     parser.add_argument("--output", type=str, default=None,
                         help="Output path (default: auto-generated, if output_format is png, it will be a directory)")
     parser.add_argument("--output_format", type=str, default="video", choices=["video", "png"],
@@ -560,6 +656,38 @@ def main():
     args = parse_arguments()
     debug.enabled = args.debug
 
+    try:
+        meta = probe_video_meta(args.video_path)
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}")
+        sys.exit(1)
+
+    fps_display = f"{meta['fps']:.4f}" if meta.get("fps") is not None else "unknown"
+    if meta.get("width") is not None and meta.get("height") is not None:
+        size_display = f"{meta['width']}x{meta['height']}"
+    else:
+        size_display = "unknown"
+    total_display = meta.get("total_frames") if meta.get("total_frames") is not None else "unknown"
+    print(f"[INFO] Probed meta: fps={fps_display}, total_frames={total_display}, size={size_display}")
+    if meta.get("total_frames") is None:
+        print("[WARN] total_frames was not reported by OpenCV; a full count may require scanning (to be added in Phase 2).")
+
+    if os.environ.get("SEEDVR2_CHUNK_DRY_RUN") == "1":
+        dry_run_chunk_size = args.load_cap if args.load_cap and args.load_cap > 0 else meta.get("total_frames") or 512
+        print(f"[INFO] Running chunk extractor dry run with chunk_size={dry_run_chunk_size}")
+        for chunk_info in extract_frame_chunks(
+            args.video_path,
+            int(dry_run_chunk_size),
+            skip_first=args.skip_first_frames,
+            dtype=torch.float16,
+        ):
+            print(
+                f"[INFO] Dry run chunk start={chunk_info['start_idx']} count={chunk_info['raw_count']} last={chunk_info['is_last']}"
+            )
+            # Explicitly drop tensor reference to free RAM between iterations
+            chunk_info.pop("tensor", None)
+
+    
     if args.seed == -1:
         args.seed = random.randint(0, 2**32 - 1)
         print(f"[SeedVR2] Using randomized seed: {args.seed}")
