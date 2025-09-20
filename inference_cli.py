@@ -8,6 +8,7 @@ import os
 import argparse
 import time
 import platform
+import random
 import multiprocessing as mp
 
 # Set up path before any other imports to fix module resolution
@@ -501,8 +502,8 @@ def parse_arguments():
     
     parser.add_argument("--video_path", type=str, required=True,
                         help="Path to input video file")
-    parser.add_argument("--seed", type=int, default=100,
-                        help="Random seed for generation (default: 100)")
+    parser.add_argument("--seed", type=int, default=666,
+                        help="Random seed for reproducibility (default: 666). Use -1 for a random seed each run.")
     parser.add_argument("--resolution", type=int, default=1072,
                         help="Target resolution of the short side (default: 1072)")
     parser.add_argument("--batch_size", type=int, default=1,
@@ -558,7 +559,13 @@ def main():
     # Parse arguments
     args = parse_arguments()
     debug.enabled = args.debug
-    
+
+    if args.seed == -1:
+        args.seed = random.randint(0, 2**32 - 1)
+        print(f"[SeedVR2] Using randomized seed: {args.seed}")
+
+    print(f"[INFO] Using seed {args.seed}")
+
     debug.log("Arguments:", category="setup")
     for key, value in vars(args).items():
         debug.log(f"  {key}: {value}", category="none")
