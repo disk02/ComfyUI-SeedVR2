@@ -8,6 +8,8 @@ Extracted from: seedvr2.py (lines 1045-1630)
 import torch
 import types
 
+from src.common.distributed import has_mps
+
 def call_rope_with_stability(method, *args, **kwargs):
     """
     Call RoPE method with stability fixes:
@@ -50,7 +52,7 @@ class FP8CompatibleDiT(torch.nn.Module):
             self.debug.start_timer("_convert_rope_freqs")
             self._convert_rope_freqs()
             self.debug.end_timer("_convert_rope_freqs", "RoPE freqs conversion")
-            if torch.mps.is_available():
+            if has_mps():
                 self.debug.log(f"Also converting NaDiT parameters/buffers for MPS backend", category="setup", force=True)
                 self.debug.start_timer("_force_nadit_bfloat16")
                 self._force_nadit_bfloat16()
@@ -345,7 +347,7 @@ class FP8CompatibleDiT(torch.nn.Module):
             k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
             v = v.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
             
-            if torch.mps.is_available():
+            if has_mps():
                 attn_output = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v,
                     dropout_p=0.0,

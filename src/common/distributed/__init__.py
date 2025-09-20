@@ -23,6 +23,7 @@ from .basic import (
     get_global_rank,
     get_local_rank,
     get_world_size,
+    has_mps,
     init_torch,
 )
 
@@ -33,5 +34,6 @@ __all__ = [
     "get_global_rank",
     "get_local_rank",
     "get_world_size",
+    "has_mps",
     "init_torch",
 ]

@@ -20,7 +20,7 @@ import os
 import torch
 from src.utils.constants import get_script_directory
 from torchvision.transforms import Compose, Lambda, Normalize
-from src.common.distributed import get_device
+from src.common.distributed import get_device, has_mps
 
 
 # Import required modules
@@ -191,15 +191,19 @@ def generation_step(runner, text_embeds_dict, preserve_vram, cond_latents, tempo
         return [i.to(device, dtype=dtype) for i in x]
     
     # Memory optimization: Generate noise once and reuse to save VRAM
-    if torch.mps.is_available():
+    if has_mps():
         base_noise = torch.randn_like(cond_latents[0], dtype=dtype)
         noises = [base_noise]
         aug_noises = [base_noise * 0.1 + torch.randn_like(base_noise) * 0.05]
-    else:
+    elif device.type == "cuda":
         with torch.cuda.device(device):
             base_noise = torch.randn_like(cond_latents[0], dtype=dtype)
             noises = [base_noise]
             aug_noises = [base_noise * 0.1 + torch.randn_like(base_noise) * 0.05]
+    else:
+        base_noise = torch.randn_like(cond_latents[0], dtype=dtype)
+        noises = [base_noise]
+        aug_noises = [base_noise * 0.1 + torch.randn_like(base_noise) * 0.05]
     
     # Move tensors with adaptive dtype (optimized for FP8/FP16/BFloat16)
     noises, aug_noises, cond_latents = _move_to_cuda(noises), _move_to_cuda(aug_noises), _move_to_cuda(cond_latents)
@@ -325,7 +329,7 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
     if debug is None:
         raise ValueError("Debug instance must be provided to generation_loop")
     
-    device = get_device() if (torch.cuda.is_available() or torch.mps.is_available()) else "cpu"
+    device = get_device()
 
     # ────────────────────────────────────────────────────────────────────────
     # Step 1: Generation Setup - Precision & Parameters Configuration
@@ -395,7 +399,7 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
     temporal_overlap = batch_params['temporal_overlap']
 
     # Optimization tips for users (only shown for GPU/MPS users)
-    if torch.cuda.is_available() or torch.mps.is_available():
+    if device.type in {"cuda", "mps"}:
         if batch_params['padding_waste'] > 0:
             debug.log(f"", category="none", force=True)
             debug.log(f"Batch processing notice for {total_frames} frames with batch_size={batch_size}:", category="info", force=True)
