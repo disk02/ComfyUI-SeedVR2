@@ -9,6 +9,9 @@ import argparse
 import time
 import platform
 import random
+import shutil
+import subprocess
+import json
 import multiprocessing as mp
 from typing import Any, Dict, Iterator, Optional, Tuple
 
@@ -184,6 +187,101 @@ def write_png_chunk(frames_uint8_rgb: np.ndarray, out_dir: str, start_idx: int) 
         iio.imwrite(filename, frame)
 
 debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
+
+
+def _which_ffmpeg() -> str | None:
+    return shutil.which("ffmpeg")
+
+
+def _which_ffprobe() -> str | None:
+    return shutil.which("ffprobe")
+
+
+def _derive_with_audio_path(out_path: str) -> str:
+    root, ext = os.path.splitext(out_path)
+    # Always output mp4 for remux target; if you prefer to preserve ext when compatible, adjust here.
+    return root + "_with_audio.mp4"
+
+
+def _output_is_video(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in (".mp4", ".mov", ".mkv", ".m4v")
+
+
+def _probe_has_audio(src_path: str) -> bool:
+    ffprobe = _which_ffprobe()
+    if not ffprobe:
+        # If ffprobe isn't available, optimistically attempt remux and handle failure later
+        return True
+    try:
+        cmd = [ffprobe, "-v", "error", "-show_entries", "stream=codec_type,codec_name",
+               "-of", "json", "-select_streams", "a:0", src_path]
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if p.returncode != 0:
+            return True
+        data = json.loads(p.stdout.decode("utf-8") or "{}")
+        return len(data.get("streams", [])) > 0
+    except Exception:
+        return True
+
+
+def _remux_audio_copy_then_aac(upscaled_video: str, source_video: str, out_target: str) -> tuple[bool, str]:
+    """
+    Try two strategies:
+      1) Stream copy (video+audio): -c:v copy -c:a copy
+      2) If that fails, copy video and encode audio to AAC: -c:v copy -c:a aac -b:a 192k
+    Never re-encode video.
+    Returns (success, message)
+    """
+
+    def _run(cmd):
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        return p.returncode, p.stdout.decode("utf-8", "ignore"), p.stderr.decode("utf-8", "ignore")
+
+    ffmpeg = _which_ffmpeg()
+    if not ffmpeg:
+        return False, "ffmpeg not found on PATH."
+
+    tmp_out = out_target + ".tmp_remux.mp4"
+    if os.path.exists(tmp_out):
+        try:
+            os.remove(tmp_out)
+        except Exception:
+            pass
+
+    base = [ffmpeg, "-y",
+            "-i", upscaled_video,
+            "-i", source_video,
+            "-map", "0:v:0", "-map", "1:a:0?",
+            "-movflags", "+faststart"]
+
+    # 1) stream copy
+    cmd1 = base + ["-c:v", "copy", "-c:a", "copy", tmp_out]
+    rc1, _, err1 = _run(cmd1)
+    if rc1 == 0:
+        try:
+            os.replace(tmp_out, out_target)
+        finally:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        return True, "Audio passthrough (copy) succeeded."
+
+    # 2) AAC fallback
+    cmd2 = base + ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", tmp_out]
+    rc2, _, err2 = _run(cmd2)
+    if rc2 == 0:
+        try:
+            os.replace(tmp_out, out_target)
+        finally:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        return True, "Audio passthrough (AAC transcode) succeeded."
+
+    if os.path.exists(tmp_out):
+        try:
+            os.remove(tmp_out)
+        except Exception:
+            pass
+    return False, f"ffmpeg remux failed. copy_err={err1.strip()[:240]} transcode_err={err2.strip()[:240]}"
 
 
 def probe_video_meta(path: str) -> Dict[str, Optional[Any]]:
@@ -813,6 +911,12 @@ def parse_arguments():
                         help="Output path (default: auto-generated, if output_format is png, it will be a directory)")
     parser.add_argument("--output_format", type=str, default="video", choices=["video", "png"],
                         help="Output format: 'video' (mp4) or 'png' images (default: video)")
+    parser.add_argument("--no_audio_passthrough", action="store_true", default=False,
+                        help="If set, skip attaching the original audio stream; output will be silent.")
+    parser.add_argument("--overwrite_audio_passthrough", action="store_true", default=False,
+                        help="If set, overwrite the original --output file with the audio-remuxed version instead of creating _with_audio.mp4.")
+    parser.add_argument("--disable_streaming", action="store_true", default=False,
+                        help="Fallback to legacy single-shot mode (for debugging).")
     parser.add_argument("--preserve_vram", action="store_true",
                         help="Enable VRAM preservation mode")
     parser.add_argument("--debug", action="store_true",
@@ -923,7 +1027,7 @@ def main():
 
         total_start = time.time()
 
-        if len(device_list) != 1:
+        if not args.disable_streaming and len(device_list) != 1:
             raise RuntimeError("Chunked streaming currently supports single-GPU execution only.")
 
         if platform.system() == "Windows":
@@ -931,138 +1035,194 @@ def main():
 
         download_weight(args.model, args.model_dir)
 
-        chunk_size = int(args.load_cap) if args.load_cap and args.load_cap > 0 else 1000
-        if chunk_size <= 0:
-            chunk_size = 1000
-
-        est_h, est_w = estimate_output_frame_shape(meta, args.resolution)
-        est_bytes = est_h * est_w * 3 * 2 * chunk_size
-        print(
-            f"[INFO] Approx. RAM per chunk (frame buffers only) ≈ {est_bytes / (1024 ** 2):.1f} MiB "
-            f"(excludes activations/overlap; fp16, {est_w}x{est_h}x3)"
-        )
-
-        chunk_iter = extract_frame_chunks(
-            args.video_path,
-            chunk_size=chunk_size,
-            skip_first=args.skip_first_frames,
-            dtype=torch.float16,
-        )
-
-        writer: Optional[cv2.VideoWriter] = None
         writer_fps = float(args.fps) if getattr(args, "fps", None) else (float(meta.get("fps")) if meta.get("fps") else 30.0)
         total_decoded = 0
         total_written = 0
-        prev_input_tail: Optional[torch.Tensor] = None
-        prev_output_tail: Optional[torch.Tensor] = None
-        chunk_index = 0
         generation_time_total = 0.0
-        applied_prepend = 0
-        chunks_seen = 0
 
-        runner = get_or_create_runner(args, debug)
-
-        try:
-            for chunk in chunk_iter:
-                chunks_seen += 1
-                start_idx = int(chunk["start_idx"])
-                raw_tensor = chunk["tensor"].to(torch.float16)
-                raw_count = int(chunk["raw_count"])
-                is_last = bool(chunk["is_last"])
-                total_decoded += raw_count
-
-                overlap = max(int(getattr(args, "temporal_overlap", 0) or 0), 0)
-                if raw_count < overlap:
-                    print(f"[WARN] Reducing temporal overlap {overlap}->{raw_count} at chunk start={start_idx}")
-                    overlap = raw_count
-
-                model_input = raw_tensor
-                if chunk_index == 0 and args.prepend_frames > 0:
-                    prepend_tensor, applied_prepend = _build_prepend_context(raw_tensor, args.prepend_frames)
-                    if applied_prepend < args.prepend_frames:
-                        print(
-                            f"[WARN] Requested prepend {args.prepend_frames} reduced to {applied_prepend} based on available frames"
-                        )
-                    if applied_prepend > 0:
-                        model_input = torch.cat([prepend_tensor, model_input], dim=0)
-
-                if chunk_index > 0 and overlap > 0 and prev_input_tail is not None:
-                    model_input = torch.cat([prev_input_tail, model_input], dim=0)
-
-                model_input = model_input.contiguous()
-                if model_input.device.type == "cpu" and torch.cuda.is_available():
-                    model_input = model_input.pin_memory()
-
-                valid_frames = model_input.shape[0]
-
-                chunk_start = time.time()
-                result_chunk = run_chunk_with_retry(runner, model_input, args, debug)
-                generation_time_total += time.time() - chunk_start
-
-                if result_chunk.shape[0] != valid_frames:
-                    result_chunk = result_chunk[:valid_frames]
-
-                tensor_to_write = result_chunk
-                if chunk_index == 0 and applied_prepend > 0:
-                    tensor_to_write = tensor_to_write[applied_prepend:]
-
-                if chunk_index > 0 and overlap > 0 and prev_output_tail is not None:
-                    seam = apply_temporal_overlap_blending(
-                        prev_output_tail,
-                        0,  # batch_size is unused in seam mode; pass 0 for clarity
-                        overlap,
-                        next_frames=result_chunk[:overlap],
+        if args.disable_streaming:
+            print("[INFO] Running in legacy single-shot mode (--disable_streaming).")
+            load_cap = args.load_cap if args.load_cap and args.load_cap > 0 else None
+            frames_tensor, src_fps = extract_frames_from_video(
+                args.video_path,
+                skip_first_frames=args.skip_first_frames,
+                load_cap=load_cap,
+                prepend_frames=0,
+            )
+            total_decoded = int(frames_tensor.shape[0])
+            model_input = frames_tensor.to(torch.float16)
+            applied_prepend = 0
+            if args.prepend_frames > 0:
+                prepend_tensor, applied_prepend = _build_prepend_context(model_input, args.prepend_frames)
+                if applied_prepend < args.prepend_frames:
+                    print(
+                        f"[WARN] Requested prepend {args.prepend_frames} reduced to {applied_prepend} based on available frames"
                     )
-                    remainder = result_chunk[overlap:]
-                    tensor_to_write = torch.cat([seam, remainder], dim=0)
+                if applied_prepend > 0:
+                    model_input = torch.cat([prepend_tensor, model_input], dim=0)
 
-                tensor_to_write = tensor_to_write.contiguous()
+            model_input = model_input.contiguous()
+            if model_input.device.type == "cpu" and torch.cuda.is_available():
+                model_input = model_input.pin_memory()
 
-                if tensor_to_write.shape[0] == 0:
-                    prev_input_tail = raw_tensor[-overlap:] if overlap > 0 else None
-                    prev_output_tail = result_chunk[-overlap:] if overlap > 0 else None
-                    chunk_index += 1
-                    continue
+            runner = get_or_create_runner(args, debug)
+            chunk_start = time.time()
+            result_tensor = run_chunk_with_retry(runner, model_input, args, debug)
+            generation_time_total = time.time() - chunk_start
 
-                frames_uint8 = tensor_to_write.clamp(0, 1).mul(255.0).to(torch.uint8).cpu().numpy()
+            if result_tensor.shape[0] != model_input.shape[0]:
+                result_tensor = result_tensor[:model_input.shape[0]]
+            if applied_prepend > 0:
+                result_tensor = result_tensor[applied_prepend:]
 
-                if args.output_format == "video":
-                    if writer is None:
-                        writer, _, writer_fps = open_video_writer(
-                            meta,
-                            args.output,
-                            (tensor_to_write.shape[1], tensor_to_write.shape[2]),
-                            fps_override=getattr(args, "fps", None),
-                        )
-                    write_video_frames(writer, frames_uint8)
-                else:
-                    write_png_chunk(frames_uint8, args.output, total_written)
-
-                total_written += tensor_to_write.shape[0]
-
-                prev_input_tail = raw_tensor[-overlap:] if overlap > 0 else None
-                prev_output_tail = tensor_to_write[-overlap:] if overlap > 0 else None
-
-                print(
-                    f"[CHUNK] {chunk_index} start={start_idx} dec={raw_count} "
-                    f"wrote={tensor_to_write.shape[0]} last={is_last}"
-                )
-
-                chunk_index += 1
-
-            if chunks_seen == 0:
-                raise RuntimeError("No frames decoded from the input video.")
-
+            total_written = int(result_tensor.shape[0])
             if total_written == 0:
                 raise RuntimeError("No frames were written to the output destination.")
 
             if args.output_format == "video":
+                preferred_fps = (
+                    args.fps
+                    if getattr(args, "fps", None)
+                    else (meta.get("fps") if meta.get("fps") else src_fps)
+                )
+                if preferred_fps is None:
+                    preferred_fps = 30.0
+                writer_fps = float(preferred_fps)
+                save_frames_to_video(result_tensor, args.output, fps=writer_fps)
                 print(f"[SUMMARY] decoded={total_decoded} written={total_written} (fps={writer_fps})")
             else:
+                base_name = Path(args.video_path).stem or "frame"
+                save_frames_to_png(result_tensor, args.output, base_name)
                 print(f"[SUMMARY] decoded={total_decoded} written={total_written} (png)")
+        else:
+            chunk_size = int(args.load_cap) if args.load_cap and args.load_cap > 0 else 1000
+            if chunk_size <= 0:
+                chunk_size = 1000
 
-        finally:
-            close_video_writer(writer)
+            est_h, est_w = estimate_output_frame_shape(meta, args.resolution)
+            est_bytes = est_h * est_w * 3 * 2 * chunk_size
+            print(
+                f"[INFO] Approx. RAM per chunk (frame buffers only) ≈ {est_bytes / (1024 ** 2):.1f} MiB "
+                f"(excludes activations/overlap; fp16, {est_w}x{est_h}x3)"
+            )
+
+            chunk_iter = extract_frame_chunks(
+                args.video_path,
+                chunk_size=chunk_size,
+                skip_first=args.skip_first_frames,
+                dtype=torch.float16,
+            )
+
+            writer: Optional[cv2.VideoWriter] = None
+            prev_input_tail: Optional[torch.Tensor] = None
+            prev_output_tail: Optional[torch.Tensor] = None
+            chunk_index = 0
+            applied_prepend = 0
+            chunks_seen = 0
+
+            runner = get_or_create_runner(args, debug)
+
+            try:
+                for chunk in chunk_iter:
+                    chunks_seen += 1
+                    start_idx = int(chunk["start_idx"])
+                    raw_tensor = chunk["tensor"].to(torch.float16)
+                    raw_count = int(chunk["raw_count"])
+                    is_last = bool(chunk["is_last"])
+                    total_decoded += raw_count
+
+                    overlap = max(int(getattr(args, "temporal_overlap", 0) or 0), 0)
+                    if raw_count < overlap:
+                        print(f"[WARN] Reducing temporal overlap {overlap}->{raw_count} at chunk start={start_idx}")
+                        overlap = raw_count
+
+                    model_input = raw_tensor
+                    if chunk_index == 0 and args.prepend_frames > 0:
+                        prepend_tensor, applied_prepend = _build_prepend_context(raw_tensor, args.prepend_frames)
+                        if applied_prepend < args.prepend_frames:
+                            print(
+                                f"[WARN] Requested prepend {args.prepend_frames} reduced to {applied_prepend} based on available frames"
+                            )
+                        if applied_prepend > 0:
+                            model_input = torch.cat([prepend_tensor, model_input], dim=0)
+
+                    if chunk_index > 0 and overlap > 0 and prev_input_tail is not None:
+                        model_input = torch.cat([prev_input_tail, model_input], dim=0)
+
+                    model_input = model_input.contiguous()
+                    if model_input.device.type == "cpu" and torch.cuda.is_available():
+                        model_input = model_input.pin_memory()
+
+                    valid_frames = model_input.shape[0]
+
+                    chunk_start = time.time()
+                    result_chunk = run_chunk_with_retry(runner, model_input, args, debug)
+                    generation_time_total += time.time() - chunk_start
+
+                    if result_chunk.shape[0] != valid_frames:
+                        result_chunk = result_chunk[:valid_frames]
+
+                    tensor_to_write = result_chunk
+                    if chunk_index == 0 and applied_prepend > 0:
+                        tensor_to_write = tensor_to_write[applied_prepend:]
+
+                    if chunk_index > 0 and overlap > 0 and prev_output_tail is not None:
+                        seam = apply_temporal_overlap_blending(
+                            prev_output_tail,
+                            0,  # batch_size is unused in seam mode; pass 0 for clarity
+                            overlap,
+                            next_frames=result_chunk[:overlap],
+                        )
+                        remainder = result_chunk[overlap:]
+                        tensor_to_write = torch.cat([seam, remainder], dim=0)
+
+                    tensor_to_write = tensor_to_write.contiguous()
+
+                    if tensor_to_write.shape[0] == 0:
+                        prev_input_tail = raw_tensor[-overlap:] if overlap > 0 else None
+                        prev_output_tail = result_chunk[-overlap:] if overlap > 0 else None
+                        chunk_index += 1
+                        continue
+
+                    frames_uint8 = tensor_to_write.clamp(0, 1).mul(255.0).to(torch.uint8).cpu().numpy()
+
+                    if args.output_format == "video":
+                        if writer is None:
+                            writer, _, writer_fps = open_video_writer(
+                                meta,
+                                args.output,
+                                (tensor_to_write.shape[1], tensor_to_write.shape[2]),
+                                fps_override=getattr(args, "fps", None),
+                            )
+                        write_video_frames(writer, frames_uint8)
+                    else:
+                        write_png_chunk(frames_uint8, args.output, total_written)
+
+                    total_written += tensor_to_write.shape[0]
+
+                    prev_input_tail = raw_tensor[-overlap:] if overlap > 0 else None
+                    prev_output_tail = tensor_to_write[-overlap:] if overlap > 0 else None
+
+                    print(
+                        f"[CHUNK] {chunk_index} start={start_idx} dec={raw_count} "
+                        f"wrote={tensor_to_write.shape[0]} last={is_last}"
+                    )
+
+                    chunk_index += 1
+
+                if chunks_seen == 0:
+                    raise RuntimeError("No frames decoded from the input video.")
+
+                if total_written == 0:
+                    raise RuntimeError("No frames were written to the output destination.")
+
+                if args.output_format == "video":
+                    print(f"[SUMMARY] decoded={total_decoded} written={total_written} (fps={writer_fps})")
+                else:
+                    print(f"[SUMMARY] decoded={total_decoded} written={total_written} (png)")
+
+            finally:
+                close_video_writer(writer)
 
         total_time = time.time() - total_start
         debug.log(f"Upscaling completed successfully!", category="success", force=True)
@@ -1070,6 +1230,37 @@ def main():
             debug.log(f"Output saved to video: {args.output}", category="file", force=True)
         else:
             debug.log(f"PNG frames saved in directory: {args.output}", category="file", force=True)
+
+        if (
+            args.output_format == "video"
+            and args.output
+            and (not args.no_audio_passthrough)
+            and _output_is_video(args.output)
+        ):
+            ff = _which_ffmpeg()
+            if not ff:
+                print("[WARN] ffmpeg not found on PATH; skipping audio passthrough.")
+            else:
+                if _probe_has_audio(args.video_path):
+                    if args.overwrite_audio_passthrough:
+                        target_path = args.output
+                    else:
+                        target_path = _derive_with_audio_path(args.output)
+
+                    ok, msg = _remux_audio_copy_then_aac(
+                        upscaled_video=args.output,
+                        source_video=args.video_path,
+                        out_target=target_path,
+                    )
+                    if ok:
+                        print(f"[INFO] {msg}")
+                        if not args.overwrite_audio_passthrough:
+                            print(f"[INFO] Wrote remuxed file: {target_path}")
+                    else:
+                        print(f"[WARN] {msg}")
+                else:
+                    print("[INFO] No audio stream detected in source; leaving video silent.")
+
         debug.log(f"Total processing time: {total_time:.2f}s", category="timing", force=True)
         if generation_time_total > 0:
             avg_fps = total_written / generation_time_total
