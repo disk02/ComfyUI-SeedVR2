@@ -46,6 +46,7 @@ if platform.system() != "Darwin":
 import torch
 import cv2
 import numpy as np
+from PIL import Image, ImageOps
 from datetime import datetime
 from pathlib import Path
 from src.utils.downloads import download_weight
@@ -185,6 +186,47 @@ def write_png_chunk(frames_uint8_rgb: np.ndarray, out_dir: str, start_idx: int) 
     for offset, frame in enumerate(frames_uint8_rgb):
         filename = os.path.join(out_dir, f"{start_idx + offset:06d}.png")
         iio.imwrite(filename, frame)
+
+
+def _warn_ignored_video_flags_in_image_mode(args) -> None:
+    """Emit a consolidated warning for video-only flags when running on a single image."""
+
+    ignored: list[str] = []
+
+    if getattr(args, "load_cap", None):
+        ignored.append("--load_cap")
+    if getattr(args, "temporal_overlap", None):
+        ignored.append("--temporal_overlap")
+    if getattr(args, "no_audio_passthrough", False):
+        ignored.append("--no_audio_passthrough")
+    if getattr(args, "overwrite_audio_passthrough", False):
+        ignored.append("--overwrite_audio_passthrough")
+    if getattr(args, "disable_streaming", False):
+        ignored.append("--disable_streaming")
+
+    if not ignored:
+        return
+
+    unique_flags = sorted(set(ignored))
+    print(f"[WARN] Image mode: ignoring video-only options: {', '.join(unique_flags)}")
+
+
+def load_image_as_tensor(path: str) -> torch.Tensor:
+    """Load an image and return a float16 tensor with shape [1, H, W, 3] in RGB order."""
+
+    with Image.open(path) as img:
+        try:
+            img = ImageOps.exif_transpose(img)
+        except Exception:
+            # If EXIF transpose fails, continue without altering the orientation.
+            pass
+        img = img.convert("RGB")
+        arr = np.asarray(img, dtype=np.float32)
+
+    arr = arr / 255.0
+    arr = arr.astype(np.float16, copy=False)
+    tensor = torch.from_numpy(arr).unsqueeze(0)
+    return tensor
 
 debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
 
@@ -882,9 +924,12 @@ class OneOrTwoValues(argparse.Action):
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="SeedVR2 Video Upscaler CLI")
-    
-    parser.add_argument("--video_path", type=str, required=True,
+
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--video_path", type=str,
                         help="Path to input video file")
+    input_group.add_argument("--image_path", type=str,
+                        help="Path to an input image (PNG/JPG/JPEG/WEBP)")
     parser.add_argument("--seed", type=int, default=333,
                         help="Random seed for reproducibility (default: 333). Use -1 for a random seed each run.")
     parser.add_argument("--resolution", type=int, default=1072,
@@ -950,6 +995,45 @@ def main():
     # Parse arguments
     args = parse_arguments()
     debug.enabled = args.debug
+
+    if getattr(args, "image_path", None):
+        if not args.output:
+            print("[ERROR] Image mode requires --output to be specified.")
+            sys.exit(1)
+
+        _warn_ignored_video_flags_in_image_mode(args)
+
+        if args.seed == -1:
+            args.seed = random.randint(0, 2**32 - 1)
+            print(f"[SeedVR2] Using randomized seed: {args.seed}")
+
+        print(f"[INFO] Using seed {args.seed}")
+
+        frames_tensor = load_image_as_tensor(args.image_path).contiguous()
+
+        args.temporal_overlap = 0
+        args.batch_size = 1
+
+        download_weight(args.model, args.model_dir)
+
+        debug_obj = Debug(enabled=args.debug)
+
+        chunk_start = time.time()
+        runner = get_or_create_runner(args, debug_obj)
+        result_tensor = run_chunk_with_retry(
+            runner,
+            frames_tensor,
+            args,
+            debug_obj,
+        )
+        generation_time = time.time() - chunk_start
+
+        print(
+            f"[INFO] Image loaded shape: {tuple(frames_tensor.shape)} -> output shape: {tuple(result_tensor.shape)}"
+        )
+        print(f"[INFO] Generation time: {generation_time:.3f}s")
+        print("[INFO] Phase 1 image path completed (no writing yet).")
+        return
 
     try:
         meta = probe_video_meta(args.video_path)
