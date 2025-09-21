@@ -46,6 +46,7 @@ if platform.system() != "Darwin":
 import torch
 import cv2
 import numpy as np
+import imageio.v3 as iio
 from PIL import Image, ImageOps
 from datetime import datetime
 from pathlib import Path
@@ -188,6 +189,9 @@ def write_png_chunk(frames_uint8_rgb: np.ndarray, out_dir: str, start_idx: int) 
         iio.imwrite(filename, frame)
 
 
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+
+
 def _warn_ignored_video_flags_in_image_mode(args) -> None:
     """Emit a consolidated warning for video-only flags when running on a single image."""
 
@@ -227,6 +231,44 @@ def load_image_as_tensor(path: str) -> torch.Tensor:
     arr = arr.astype(np.float16, copy=False)
     tensor = torch.from_numpy(arr).unsqueeze(0)
     return tensor
+
+
+def _resolve_image_output_path(image_in: str, output_arg: str) -> str:
+    import os
+
+    if not output_arg:
+        raise ValueError("Image mode requires --output (file path or directory).")
+
+    root, ext = os.path.splitext(output_arg)
+    if ext.lower() in IMAGE_EXTS:
+        out_dir = os.path.dirname(output_arg)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        return output_arg
+
+    os.makedirs(output_arg, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(image_in))[0]
+    return os.path.join(output_arg, f"{stem}_upscaled.png")
+
+
+def write_single_image(
+    tensor_fp16_rgb_TCHW: torch.Tensor | None,
+    tensor_fp16_rgb_THWC: torch.Tensor | None,
+    out_path: str,
+) -> None:
+    """Write a single RGB image from fp16 tensors in [0, 1]."""
+
+    if tensor_fp16_rgb_THWC is None and tensor_fp16_rgb_TCHW is None:
+        raise ValueError("No image tensor provided")
+
+    if tensor_fp16_rgb_THWC is None:
+        x = tensor_fp16_rgb_TCHW.permute(0, 2, 3, 1).contiguous()
+    else:
+        x = tensor_fp16_rgb_THWC
+
+    x = x[0]
+    x = torch.clamp(x, 0.0, 1.0).mul(255.0).to(torch.uint8).cpu().numpy()
+    iio.imwrite(out_path, x)
 
 debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
 
@@ -928,8 +970,11 @@ def parse_arguments():
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument("--video_path", type=str,
                         help="Path to input video file")
-    input_group.add_argument("--image_path", type=str,
-                        help="Path to an input image (PNG/JPG/JPEG/WEBP)")
+    input_group.add_argument(
+        "--image_path",
+        type=str,
+        help="Path to an input image (PNG/JPG/JPEG/WEBP). Applies EXIF orientation, converts to RGB, and drops alpha.",
+    )
     parser.add_argument("--seed", type=int, default=333,
                         help="Random seed for reproducibility (default: 333). Use -1 for a random seed each run.")
     parser.add_argument("--resolution", type=int, default=1072,
@@ -952,8 +997,15 @@ def parse_arguments():
                         help="Maximum frames in RAM at once; video is processed in multiple chunks until EOF.")
     parser.add_argument("--fps", type=float, default=None,
                         help="Override output FPS; defaults to the probed source FPS when unset.")
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output path (default: auto-generated, if output_format is png, it will be a directory)")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help=(
+            "Output path. For videos, behaves as before. In image mode, accepts an image filename (.png/.jpg/.jpeg/.webp) "
+            "or a directory (writes <stem>_upscaled.png)."
+        ),
+    )
     parser.add_argument("--output_format", type=str, default="video", choices=["video", "png"],
                         help="Output format: 'video' (mp4) or 'png' images (default: video)")
     parser.add_argument("--no_audio_passthrough", action="store_true", default=False,
@@ -997,10 +1049,6 @@ def main():
     debug.enabled = args.debug
 
     if getattr(args, "image_path", None):
-        if not args.output:
-            print("[ERROR] Image mode requires --output to be specified.")
-            sys.exit(1)
-
         _warn_ignored_video_flags_in_image_mode(args)
 
         if args.seed == -1:
@@ -1028,11 +1076,20 @@ def main():
         )
         generation_time = time.time() - chunk_start
 
+        try:
+            out_path = _resolve_image_output_path(args.image_path, args.output)
+        except ValueError as exc:
+            print(f"[ERROR] {exc}")
+            sys.exit(1)
+
+        write_single_image(None, result_tensor, out_path)
+
+        in_h, in_w = int(frames_tensor.shape[1]), int(frames_tensor.shape[2])
+        out_h, out_w = int(result_tensor.shape[1]), int(result_tensor.shape[2])
         print(
-            f"[INFO] Image loaded shape: {tuple(frames_tensor.shape)} -> output shape: {tuple(result_tensor.shape)}"
+            f"[INFO] Image: {in_w}x{in_h} → {out_w}x{out_h}, seed={args.seed}, wrote: {out_path}"
         )
         print(f"[INFO] Generation time: {generation_time:.3f}s")
-        print("[INFO] Phase 1 image path completed (no writing yet).")
         return
 
     try:
