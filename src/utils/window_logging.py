@@ -22,6 +22,8 @@ class WindowMeta:
     nh: int
     nw: int
     variant: Variant
+    proxy_h: Optional[int] = None
+    proxy_w: Optional[int] = None
 
 
 @dataclass
@@ -206,11 +208,16 @@ class WindowLogger:
     def log_meta(self, meta: WindowMeta) -> None:
         if not self.config.log_window_info:
             return
-        line = (
-            f"[ATTN] ATTN_MODE={meta.attn_mode} latent=[{meta.dt},{meta.dh},{meta.dw}] "
-            f"window=[{meta.pt},{meta.ph},{meta.pw}] counts=[{meta.nt},{meta.nh},{meta.nw}] "
-            f"variant={meta.variant}"
-        )
+        parts = [
+            f"[ATTN] ATTN_MODE={meta.attn_mode}",
+            f"latent=[{meta.dt},{meta.dh},{meta.dw}]",
+            f"window=[{meta.pt},{meta.ph},{meta.pw}]",
+            f"counts=[{meta.nt},{meta.nh},{meta.nw}]",
+            f"variant={meta.variant}",
+        ]
+        if meta.proxy_h is not None or meta.proxy_w is not None:
+            parts.insert(3, f"proxy=[{meta.proxy_h if meta.proxy_h is not None else 'None'},{meta.proxy_w if meta.proxy_w is not None else 'None'}]")
+        line = " ".join(parts)
         print(line)
 
     def record_plan(self, plan: WindowPlanDump) -> None:
@@ -227,15 +234,24 @@ class WindowLogger:
         latent: Tuple[int, int, int],
         regular_slices: Iterable[Tuple[slice, slice, slice]],
         shifted_slices: Iterable[Tuple[slice, slice, slice]],
+        *,
+        plan: Optional[WindowPlanDump] = None,
+        proxy_hw: Optional[Tuple[int, int]] = None,
     ) -> None:
         if not self.enabled:
             return
         regular_list = list(regular_slices)
         shifted_list = list(shifted_slices)
-        metas, plan = build_window_metas(attn_mode, latent, regular_list, shifted_list)
+        metas, computed_plan = build_window_metas(attn_mode, latent, regular_list, shifted_list)
+        if proxy_hw is not None:
+            proxy_h, proxy_w = proxy_hw
+            for meta in metas:
+                meta.proxy_h = proxy_h
+                meta.proxy_w = proxy_w
+        plan_dump = plan if plan is not None else computed_plan
         for meta in metas:
             self.log_meta(meta)
-        self.record_plan(plan)
+        self.record_plan(plan_dump)
 
     def maybe_make_overlay(self, image_path: str, out_path: Optional[str] = None) -> Optional[str]:
         if not self.config.make_window_overlay:

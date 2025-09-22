@@ -79,6 +79,9 @@ def get_or_create_runner(args, debug_obj):
         int(getattr(args, "blocks_to_swap", 0)),
         bool(getattr(args, "offload_io_components", False)),
         bool(getattr(args, "use_none_blocking", True)),
+        bool(getattr(args, "force_adaptive_windows", False)),
+        bool(getattr(args, "force_fixed_windows", False)),
+        bool(getattr(args, "rope_apply_global", False)),
     )
 
     window_logging_config = WindowLoggingConfig(
@@ -117,6 +120,9 @@ def get_or_create_runner(args, debug_obj):
         vae_tile_size=getattr(args, "vae_tile_size", 0),
         vae_tile_overlap=getattr(args, "vae_tile_overlap", 0),
         window_logging_config=window_logging_config,
+        force_adaptive_windows=bool(getattr(args, "force_adaptive_windows", False)),
+        force_fixed_windows=bool(getattr(args, "force_fixed_windows", False)),
+        rope_apply_global=bool(getattr(args, "rope_apply_global", False)),
     )
     _RUNNER_CACHE[key] = runner
     return runner
@@ -1197,7 +1203,19 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
     # ensure model weights present (each process checks but very fast if already downloaded)
     worker_debug.log(f"Configuring runner for device {device_id}", category="setup")
     # BlockSwap wiring: nightly expects config here (configure_runner), not generation_loop.
-    runner = configure_runner(model_name, model_dir, shared_args["preserve_vram"], worker_debug, block_swap_config=shared_args["block_swap_config"], vae_tiling_enabled=shared_args["vae_tiling_enabled"], vae_tile_size=shared_args["vae_tile_size"], vae_tile_overlap=shared_args["vae_tile_overlap"])
+    runner = configure_runner(
+        model_name,
+        model_dir,
+        shared_args["preserve_vram"],
+        worker_debug,
+        block_swap_config=shared_args["block_swap_config"],
+        vae_tiling_enabled=shared_args["vae_tiling_enabled"],
+        vae_tile_size=shared_args["vae_tile_size"],
+        vae_tile_overlap=shared_args["vae_tile_overlap"],
+        force_adaptive_windows=shared_args.get("force_adaptive_windows", False),
+        force_fixed_windows=shared_args.get("force_fixed_windows", False),
+        rope_apply_global=shared_args.get("rope_apply_global", False),
+    )
 
     # Run generation
     result_tensor = generation_loop(
@@ -1286,6 +1304,9 @@ def _gpu_processing(frames_tensor, device_list, args):
         "vae_tiling_enabled": args.vae_tiling_enabled,
         "vae_tile_size": args.vae_tile_size,
         "vae_tile_overlap": args.vae_tile_overlap,
+        "force_adaptive_windows": bool(getattr(args, "force_adaptive_windows", False)),
+        "force_fixed_windows": bool(getattr(args, "force_fixed_windows", False)),
+        "rope_apply_global": bool(getattr(args, "rope_apply_global", False)),
     }
 
     for idx, (device_id, chunk_tensor) in enumerate(zip(device_list, chunks)):
@@ -1502,6 +1523,24 @@ def parse_arguments():
         default=False,
         help="Generate a *_windows.png overlay using the last window plan (image mode).",
     )
+    parser.add_argument(
+        "--force_adaptive_windows",
+        action="store_true",
+        default=False,
+        help="Force adaptive window attention regardless of model defaults.",
+    )
+    parser.add_argument(
+        "--force_fixed_windows",
+        action="store_true",
+        default=False,
+        help="Force legacy fixed (720p) window attention regardless of model defaults.",
+    )
+    parser.add_argument(
+        "--rope_apply_global",
+        action="store_true",
+        default=False,
+        help="Apply mm-aware RoPE across the full latent grid before windowing.",
+    )
     if platform.system() != "Darwin":
         parser.add_argument("--cuda_device", type=str, default=None,
                         help="CUDA device id(s). Single id (e.g., '0') or comma-separated list '0,1' for multi-GPU")
@@ -1522,6 +1561,8 @@ def parse_arguments():
     parser.add_argument("--vae_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
                         help="VAE tile overlap (default: 128). Use single integer or two integers 'h w'. Only used if --vae_tiling_enabled is set")
     args = parser.parse_args()
+    if args.force_adaptive_windows and args.force_fixed_windows:
+        parser.error("Choose either --force_adaptive_windows or --force_fixed_windows, not both.")
     _validate_inputs(args)
     return args
 

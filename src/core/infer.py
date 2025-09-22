@@ -95,7 +95,41 @@ class VideoDiffusionInfer():
         if hasattr(self, "dit"):
             target = getattr(self.dit, "dit_model", self.dit)
             attach_window_logger(target, self.window_logger)
-        
+
+    def set_window_runtime_flags(
+        self,
+        *,
+        force_adaptive_windows: bool = False,
+        force_fixed_windows: bool = False,
+        rope_apply_global: bool = False,
+    ) -> None:
+        if hasattr(self, "dit"):
+            target = getattr(self.dit, "dit_model", self.dit)
+        else:
+            return
+
+        model_name = getattr(self, "_model_name", "") or ""
+        model_is_7b = "7b" in model_name.lower()
+
+        if force_adaptive_windows and force_fixed_windows:
+            raise ValueError("force_adaptive_windows and force_fixed_windows cannot both be True")
+
+        if force_adaptive_windows:
+            adaptive_windows = True
+        elif force_fixed_windows:
+            adaptive_windows = False
+        else:
+            adaptive_windows = model_is_7b
+
+        rope_global = rope_apply_global or model_is_7b
+
+        for module in target.modules():
+            if hasattr(module, "set_runtime_window_flags"):
+                module.set_runtime_window_flags(
+                    adaptive_windows=adaptive_windows,
+                    rope_apply_global=rope_global,
+                )
+
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
         t, h, w, c = latent.shape
         cond = torch.zeros([t, h, w, c + 1], device=latent.device, dtype=latent.dtype)
