@@ -29,6 +29,7 @@ from ...mm import MMArg, MMModule
 from ...normalization import norm_layer_type
 from ...rope import get_na_rope
 from ...window import get_window_op
+from .....utils.window_logging import WindowLogger
 from itertools import chain
 
 
@@ -154,6 +155,9 @@ class NaSwinAttention(NaMMAttention):
         assert all(map(lambda v: isinstance(v, int) and v >= 0, self.window))
 
         self.window_op = get_window_op(window_method)
+        self._log_regular_window_op = get_window_op("720pwin_by_size_bysize")
+        self._log_shifted_window_op = get_window_op("720pswin_by_size_bysize")
+        self.window_logger: Optional[WindowLogger] = None
 
     def forward(
         self,
@@ -166,6 +170,14 @@ class NaSwinAttention(NaMMAttention):
         torch.FloatTensor,
         torch.FloatTensor,
     ]:
+
+        window_logger = getattr(self, "window_logger", None)
+        if window_logger is not None and window_logger.enabled:
+            latent_shape = tuple(int(v) for v in vid_shape[0].tolist())
+            base_window = tuple(int(v) for v in self.window)
+            regular_slices = self._log_regular_window_op(latent_shape, base_window)
+            shifted_slices = self._log_shifted_window_op(latent_shape, base_window)
+            window_logger.process("fixed", latent_shape, regular_slices, shifted_slices)
 
         vid_qkv, txt_qkv = self.proj_qkv(vid, txt)
         vid_qkv = gather_seq_scatter_heads_qkv(

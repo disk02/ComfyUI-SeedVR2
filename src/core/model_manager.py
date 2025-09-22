@@ -40,9 +40,9 @@ from src.optimization.blockswap import cleanup_blockswap
 script_directory = get_script_directory()
 
 
-def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None, 
+def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None,
                     cache_model=False, block_swap_config=None, cached_runner=None, vae_tiling_enabled=False,
-                    vae_tile_size=None, vae_tile_overlap=None):
+                    vae_tile_size=None, vae_tile_overlap=None, window_logging_config=None):
     """
     Configure and create a VideoDiffusionInfer runner for the specified model
     
@@ -119,6 +119,8 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None,
         # Store debug instance on runner
         cached_runner.debug = debug
 
+        cached_runner.set_window_logging_config(window_logging_config)
+        cached_runner.refresh_window_logger_bindings()
         return cached_runner
         
     else:
@@ -209,6 +211,8 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None,
     # Store debug instance on runner for consistent access
     runner.debug = debug
     
+    runner.set_window_logging_config(window_logging_config)
+    runner.refresh_window_logger_bindings()
     return runner
 
 

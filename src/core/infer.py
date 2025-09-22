@@ -18,6 +18,11 @@ from einops import rearrange
 from omegaconf import DictConfig, ListConfig
 from torch import Tensor
 from src.optimization.memory_manager import clear_memory, manage_model_device
+from src.utils.window_logging import (
+    WindowLogger,
+    WindowLoggingConfig,
+    attach_window_logger,
+)
 
 from src.common.diffusion import (
     classifier_free_guidance_dispatcher,
@@ -77,6 +82,19 @@ class VideoDiffusionInfer():
         self.vae_tiling_enabled = vae_tiling_enabled
         self.vae_tile_size = vae_tile_size
         self.vae_tile_overlap = vae_tile_overlap
+        self.window_logger = WindowLogger(WindowLoggingConfig())
+
+    def set_window_logging_config(self, config: Optional[WindowLoggingConfig]) -> None:
+        config = config or WindowLoggingConfig()
+        self.window_logger.update_config(config)
+        if hasattr(self, "dit"):
+            target = getattr(self.dit, "dit_model", self.dit)
+            attach_window_logger(target, self.window_logger)
+
+    def refresh_window_logger_bindings(self) -> None:
+        if hasattr(self, "dit"):
+            target = getattr(self.dit, "dit_model", self.dit)
+            attach_window_logger(target, self.window_logger)
         
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
         t, h, w, c = latent.shape

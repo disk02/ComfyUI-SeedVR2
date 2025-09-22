@@ -12,7 +12,7 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 import torch
 from einops import rearrange
 from torch.nn import functional as F
@@ -29,6 +29,7 @@ from ..modulation import ada_layer_type
 from ..normalization import norm_layer_type
 from ..rope import NaRotaryEmbedding3d
 from ..window import get_window_op
+from ....utils.window_logging import WindowLogger
 from ....common.half_precision_fixes import safe_pad_operation
 
 class NaSwinAttention(MMWindowAttention):
@@ -63,6 +64,9 @@ class NaSwinAttention(MMWindowAttention):
         self.rope = NaRotaryEmbedding3d(dim=head_dim // 2) if qk_rope else None
         self.attn = FlashAttentionVarlen()
         self.window_op = get_window_op(window_method)
+        self._log_regular_window_op = get_window_op("720pwin_by_size_bysize")
+        self._log_shifted_window_op = get_window_op("720pswin_by_size_bysize")
+        self.window_logger: Optional[WindowLogger] = None
 
     def forward(
         self,
@@ -75,6 +79,14 @@ class NaSwinAttention(MMWindowAttention):
         torch.FloatTensor,
         torch.FloatTensor,
     ]:
+
+        window_logger = getattr(self, "window_logger", None)
+        if window_logger is not None and window_logger.enabled:
+            latent_shape = tuple(int(v) for v in vid_shape[0].tolist())
+            base_window = tuple(int(v) for v in self.window)
+            regular_slices = self._log_regular_window_op(latent_shape, base_window)
+            shifted_slices = self._log_shifted_window_op(latent_shape, base_window)
+            window_logger.process("fixed", latent_shape, regular_slices, shifted_slices)
 
         vid_qkv, txt_qkv = self.proj_qkv(vid, txt)
         vid_qkv = gather_seq_scatter_heads_qkv(

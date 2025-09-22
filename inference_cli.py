@@ -53,6 +53,7 @@ from datetime import datetime
 from pathlib import Path
 from src.utils.downloads import download_weight
 from src.utils.debug import Debug
+from src.utils.window_logging import WindowLoggingConfig
 
 
 _RUNNER_CACHE: Dict[Tuple[Any, ...], Any] = {}
@@ -80,8 +81,17 @@ def get_or_create_runner(args, debug_obj):
         bool(getattr(args, "use_none_blocking", True)),
     )
 
+    window_logging_config = WindowLoggingConfig(
+        log_window_info=bool(getattr(args, "log_window_info", False)),
+        dump_window_plan=getattr(args, "dump_window_plan", None),
+        make_window_overlay=bool(getattr(args, "make_window_overlay", False)),
+    )
+
     if key in _RUNNER_CACHE:
-        return _RUNNER_CACHE[key]
+        runner = _RUNNER_CACHE[key]
+        runner.debug = debug_obj
+        runner.set_window_logging_config(window_logging_config)
+        return runner
 
     from src.core.model_manager import configure_runner
 
@@ -106,6 +116,7 @@ def get_or_create_runner(args, debug_obj):
         vae_tiling_enabled=getattr(args, "vae_tiling_enabled", False),
         vae_tile_size=getattr(args, "vae_tile_size", 0),
         vae_tile_overlap=getattr(args, "vae_tile_overlap", 0),
+        window_logging_config=window_logging_config,
     )
     _RUNNER_CACHE[key] = runner
     return runner
@@ -124,6 +135,8 @@ def _generation_with_runner(runner, model_in: torch.Tensor, batch_size: int, arg
 
     effective_batch = max(1, int(batch_size))
     model_in = model_in.to(torch.float16)
+    if hasattr(runner, "window_logger"):
+        runner.window_logger.begin_capture()
     return generation_loop(
         runner=runner,
         images=model_in,
@@ -469,6 +482,14 @@ def _run_single_image(args, image_path: str) -> None:
     except Exception as exc:
         raise SystemExit(f"[ERROR] Failed to write image: {exc}")
 
+    if getattr(args, "make_window_overlay", False) and hasattr(runner, "window_logger"):
+        overlay_path = runner.window_logger.maybe_make_overlay(out_path)
+        if overlay_path:
+            print(f"[INFO] Window overlay: {overlay_path}")
+        elif not getattr(runner.window_logger, "_overlay_warned", False):
+            print("[WARN] Window overlay requested but no window plan was captured.")
+            runner.window_logger._overlay_warned = True
+
     out_h, out_w = int(result_tensor.shape[1]), int(result_tensor.shape[2])
     print(
         f"[INFO] Image: {in_w}x{in_h} → {out_w}x{out_h}, seed={effective_seed}, wrote: {out_path}"
@@ -585,6 +606,14 @@ def _run_batch_images(args) -> None:
             print(f"[WARN] Failed: {path} :: {exc}")
             args.seed = original_seed
             continue
+
+        if getattr(args, "make_window_overlay", False) and hasattr(runner, "window_logger"):
+            overlay_path = runner.window_logger.maybe_make_overlay(out_path)
+            if overlay_path:
+                print(f"[INFO] Window overlay: {overlay_path}")
+            elif not getattr(runner.window_logger, "_overlay_warned", False):
+                print("[WARN] Window overlay requested but no window plan was captured.")
+                runner.window_logger._overlay_warned = True
 
         processed += 1
         elapsed_all = time.time() - start_all
@@ -1455,6 +1484,24 @@ def parse_arguments():
                         help="Enable VRAM preservation mode")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
+    parser.add_argument(
+        "--log_window_info",
+        action="store_true",
+        default=False,
+        help="Log latent/window sizes and counts for each attention block (opt-in).",
+    )
+    parser.add_argument(
+        "--dump_window_plan",
+        type=str,
+        default=None,
+        help="Write a JSON dump describing the final window lattice (opt-in).",
+    )
+    parser.add_argument(
+        "--make_window_overlay",
+        action="store_true",
+        default=False,
+        help="Generate a *_windows.png overlay using the last window plan (image mode).",
+    )
     if platform.system() != "Darwin":
         parser.add_argument("--cuda_device", type=str, default=None,
                         help="CUDA device id(s). Single id (e.g., '0') or comma-separated list '0,1' for multi-GPU")
