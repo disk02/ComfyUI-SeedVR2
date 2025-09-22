@@ -39,7 +39,15 @@ from src.optimization.blockswap import apply_block_swap_to_dit
 script_directory = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def configure_runner(model, base_cache_dir, preserve_vram=False, debug=False, block_swap_config=None, cached_runner=None):
+def configure_runner(
+    model,
+    base_cache_dir,
+    preserve_vram=False,
+    debug=False,
+    block_swap_config=None,
+    cached_runner=None,
+    log_window_info=False,
+):
     """
     Configure and create a VideoDiffusionInfer runner for the specified model
     
@@ -49,6 +57,7 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=False, bl
         preserve_vram (bool): Whether to preserve VRAM
         debug (bool): Enable debug logging
         block_swap_config (dict): Optional BlockSwap configuration
+        log_window_info (bool): Enable attention window logging instrumentation
         cached_runner: Optional cached runner to reuse entirely (not just DiT)
         
     Returns:
@@ -133,6 +142,9 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=False, bl
     # DiT model configuration is now handled directly in the YAML config files
     # No need for dynamic path resolution here anymore!
 
+    if log_window_info:
+        config.dit.model["log_window_info"] = bool(log_window_info)
+
     # Load and configure VAE with additional parameters
     vae_config_path = os.path.join(script_directory, 'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')
     t = time.time()
@@ -159,6 +171,7 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=False, bl
     t = time.time()
     # Create runner
     runner = VideoDiffusionInfer(config, debug)
+    runner._log_window_info = bool(log_window_info)
     OmegaConf.set_readonly(runner.config, False)
     # Store model name for cache validation
     runner._model_name = model

@@ -53,6 +53,7 @@ class NaMMSRTransformerBlock(nn.Module):
         dim = MMArg(vid_dim, txt_dim)
         self.attn_norm = MMModule(norm, dim=dim, eps=norm_eps, elementwise_affine=False, shared_weights=shared_weights,)
 
+        log_window_info = kwargs.pop("log_window_info", False)
         self.attn = NaSwinAttention(
             vid_dim=vid_dim,
             txt_dim=txt_dim,
@@ -66,6 +67,7 @@ class NaMMSRTransformerBlock(nn.Module):
             shared_weights=shared_weights,
             window=kwargs.pop("window", None),
             window_method=kwargs.pop("window_method", None),
+            log_window_info=log_window_info,
         )
 
         self.mlp_norm = MMModule(norm, dim=dim, eps=norm_eps, elementwise_affine=False, shared_weights=shared_weights, vid_only=is_last_layer)
@@ -78,6 +80,15 @@ class NaMMSRTransformerBlock(nn.Module):
         )
         self.ada = MMModule(ada, dim=dim, emb_dim=emb_dim, layers=["attn", "mlp"], shared_weights=shared_weights, vid_only=is_last_layer)
         self.is_last_layer = is_last_layer
+
+    def set_layer_index(self, layer_index: int, attention_variant: str = "dit_v2"):
+        if hasattr(self.attn, "set_layer_index"):
+            self.attn.set_layer_index(layer_index, attention_variant)
+
+    def pop_window_lattice(self):
+        if hasattr(self.attn, "pop_window_lattice"):
+            return self.attn.pop_window_lattice()
+        return []
 
     def forward(
         self,

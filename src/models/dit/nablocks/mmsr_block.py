@@ -13,6 +13,7 @@
 # // limitations under the License.
 
 from typing import Tuple, Union
+import math
 import torch
 from einops import rearrange
 from torch.nn import functional as F
@@ -45,6 +46,7 @@ class NaSwinAttention(MMWindowAttention):
         window: Union[int, Tuple[int, int, int]],
         window_method: str,
         shared_qkv: bool,
+        log_window_info: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -63,6 +65,82 @@ class NaSwinAttention(MMWindowAttention):
         self.rope = NaRotaryEmbedding3d(dim=head_dim // 2) if qk_rope else None
         self.attn = FlashAttentionVarlen()
         self.window_op = get_window_op(window_method)
+        self._log_window_info = bool(log_window_info)
+        self._did_log_banner = False
+        self._lattice_cache = []
+        self._layer_index = None
+        self._attention_variant = "dit"
+
+    @staticmethod
+    def _compute_lattice(latent_shape, base_window, shifted=False):
+        t, h, w = latent_shape
+        base_nt, base_nh, base_nw = base_window
+        resized_nt = base_nt if base_nt else 1
+        resized_nh = base_nh if base_nh else 1
+        resized_nw = base_nw if base_nw else 1
+        safe_hw = max(h * w, 1)
+        scale = math.sqrt((45 * 80) / safe_hw)
+        resized_h = round(h * scale)
+        resized_w = round(w * scale)
+        wh = math.ceil(resized_h / resized_nh) if resized_nh else h
+        ww = math.ceil(resized_w / resized_nw) if resized_nw else w
+        wt = math.ceil(min(t, 30) / resized_nt) if resized_nt else max(t, 1)
+        wt = max(wt, 1)
+        wh = max(wh, 1)
+        ww = max(ww, 1)
+
+        if shifted:
+            st = 0.5 if wt < t else 0.0
+            sh = 0.5 if wh < h else 0.0
+            sw = 0.5 if ww < w else 0.0
+            nt = math.ceil((t - st) / wt) if wt else 0
+            nh = math.ceil((h - sh) / wh) if wh else 0
+            nw = math.ceil((w - sw) / ww) if ww else 0
+            nt = nt + 1 if st > 0 else 1
+            nh = nh + 1 if sh > 0 else 1
+            nw = nw + 1 if sw > 0 else 1
+        else:
+            nt = math.ceil(t / wt) if wt else 0
+            nh = math.ceil(h / wh) if wh else 0
+            nw = math.ceil(w / ww) if ww else 0
+
+        return (int(wt), int(wh), int(ww)), (int(nt), int(nh), int(nw))
+
+    def _maybe_log_lattice(self, vid_shape: torch.LongTensor):
+        if not self._log_window_info or self._did_log_banner:
+            return
+
+        latent_dims = tuple(int(x) for x in vid_shape[0].tolist())
+        regular_p, regular_n = self._compute_lattice(latent_dims, self.window, shifted=False)
+        shifted_p, shifted_n = self._compute_lattice(latent_dims, self.window, shifted=True)
+        module_label = f"{self.__class__.__name__}(layer={self._layer_index if self._layer_index is not None else 'NA'}, variant={self._attention_variant})"
+        latent_str = f"[{latent_dims[0]},{latent_dims[1]},{latent_dims[2]}]"
+        regular_p_str = f"[{regular_p[0]},{regular_p[1]},{regular_p[2]}]"
+        regular_n_str = f"[{regular_n[0]},{regular_n[1]},{regular_n[2]}]"
+        shifted_p_str = f"[{shifted_p[0]},{shifted_p[1]},{shifted_p[2]}]"
+        shifted_n_str = f"[{shifted_n[0]},{shifted_n[1]},{shifted_n[2]}]"
+        print(
+            f"[ATTN] ATTN_MODE=fixed latent={latent_str} "
+            f"regular p={regular_p_str} n={regular_n_str} "
+            f"shifted p={shifted_p_str} n={shifted_n_str} module={module_label}"
+        )
+        self._lattice_cache.append(
+            {
+                "latent": [int(x) for x in latent_dims],
+                "regular": {"p": [int(x) for x in regular_p], "n": [int(x) for x in regular_n]},
+                "shifted": {"p": [int(x) for x in shifted_p], "n": [int(x) for x in shifted_n]},
+                "module": module_label,
+            }
+        )
+        self._did_log_banner = True
+
+    def set_layer_index(self, layer_index: int, attention_variant: str = "dit"):
+        self._layer_index = layer_index
+        self._attention_variant = attention_variant or self._attention_variant
+
+    def pop_window_lattice(self):
+        data, self._lattice_cache = self._lattice_cache, []
+        return data
 
     def forward(
         self,
@@ -92,6 +170,8 @@ class NaSwinAttention(MMWindowAttention):
 
         # re-org the input seq for window attn
         cache_win = cache.namespace(f"{self.window_method}_{self.window}_sd3")
+
+        self._maybe_log_lattice(vid_shape)
 
         def make_window(x: torch.Tensor):
             t, h, w, _ = x.shape
@@ -176,6 +256,7 @@ class NaMMSRTransformerBlock(MMWindowTransformerBlock):
         mlp_type: str,
         **kwargs,
     ):
+        log_window_info = kwargs.pop("log_window_info", False)
         super().__init__(
             vid_dim=vid_dim,
             txt_dim=txt_dim,
@@ -205,8 +286,18 @@ class NaMMSRTransformerBlock(MMWindowTransformerBlock):
             qk_norm=qk_norm,
             qk_norm_eps=norm_eps,
             shared_qkv=shared_qkv,
+            log_window_info=log_window_info,
             **kwargs,
         )
+
+    def set_layer_index(self, layer_index: int, attention_variant: str = "dit"):
+        if hasattr(self.attn, "set_layer_index"):
+            self.attn.set_layer_index(layer_index, attention_variant)
+
+    def pop_window_lattice(self):
+        if hasattr(self.attn, "pop_window_lattice"):
+            return self.attn.pop_window_lattice()
+        return []
 
     def forward(
         self,

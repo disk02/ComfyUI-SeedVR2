@@ -7,6 +7,8 @@ import sys
 import os
 import argparse
 import time
+import json
+import subprocess
 import multiprocessing as mp
 # Ensure safe CUDA usage with multiprocessing
 if mp.get_start_method(allow_none=True) != 'spawn':
@@ -211,6 +213,21 @@ def save_frames_to_png(frames_tensor, output_dir, base_name, debug=False):
         print(f"✅ PNG saving completed: {total} files in '{output_dir}'")
 
 
+def _collect_window_lattice_data(runner):
+    """Extract window lattice metadata from all attention blocks."""
+    lattice = []
+    dit_model = getattr(runner, "dit", None)
+    if dit_model is None:
+        return lattice
+    for module in dit_model.modules():
+        popper = getattr(module, "pop_window_lattice", None)
+        if callable(popper):
+            data = popper()
+            if data:
+                lattice.extend(data)
+    return lattice
+
+
 def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
     """Worker process that performs upscaling on a slice of frames using a dedicated GPU."""
     # 1. Limit CUDA visibility to the chosen GPU BEFORE importing torch-heavy deps
@@ -232,7 +249,13 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
     # ensure model weights present (each process checks but very fast if already downloaded)
     if shared_args["debug"]:
         print(f"🔄 Configuring runner for device {device_id}")
-    runner = configure_runner(model_name, model_dir, shared_args["preserve_vram"], shared_args["debug"])
+    runner = configure_runner(
+        model_name,
+        model_dir,
+        shared_args["preserve_vram"],
+        shared_args["debug"],
+        log_window_info=shared_args.get("log_window_info", False),
+    )
 
     # Run generation
     result_tensor = generation_loop(
@@ -247,8 +270,12 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
         debug=shared_args["debug"],
     )
 
+    lattice_data = []
+    if shared_args.get("log_window_info", False):
+        lattice_data = _collect_window_lattice_data(runner)
+
     # Send back result as numpy array to avoid CUDA transfers
-    return_queue.put((proc_idx, result_tensor.cpu().numpy()))
+    return_queue.put((proc_idx, result_tensor.cpu().numpy(), lattice_data))
 
 
 def _gpu_processing(frames_tensor, device_list, args):
@@ -271,6 +298,7 @@ def _gpu_processing(frames_tensor, device_list, args):
         "res_w": args.resolution,
         "batch_size": args.batch_size,
         "temporal_overlap": 0,
+        "log_window_info": args.log_window_info,
     }
 
     for idx, (device_id, chunk_tensor) in enumerate(zip(device_list, chunks)):
@@ -282,10 +310,18 @@ def _gpu_processing(frames_tensor, device_list, args):
         workers.append(p)
 
     results_np = [None] * num_devices
+    lattice_entries = []
     collected = 0
     while collected < num_devices:
-        proc_idx, res_np = return_queue.get()
+        message = return_queue.get()
+        if len(message) == 3:
+            proc_idx, res_np, lattice = message
+        else:
+            proc_idx, res_np = message[:2]
+            lattice = []
         results_np[proc_idx] = res_np
+        if lattice:
+            lattice_entries.extend(lattice)
         collected += 1
 
     for p in workers:
@@ -293,7 +329,7 @@ def _gpu_processing(frames_tensor, device_list, args):
 
     # Concatenate results in original order
     result_tensor = torch.from_numpy(np.concatenate(results_np, axis=0)).to(torch.float16)
-    return result_tensor
+    return result_tensor, lattice_entries
 
 
 def parse_arguments():
@@ -330,9 +366,13 @@ def parse_arguments():
                         help="Enable VRAM preservation mode")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
+    parser.add_argument("--log_window_info", action="store_true",
+                        help="Log window lattice information and emit sidecar JSON")
+    parser.add_argument("--make_window_overlay", action="store_true",
+                        help="Generate a window-boundary overlay for image outputs")
     parser.add_argument("--cuda_device", type=str, default=None,
                         help="CUDA device id(s). Single id (e.g., '0') or comma-separated list '0,1' for multi-GPU")
-    
+
     return parser.parse_args()
 
 
@@ -385,7 +425,7 @@ def main():
             print(f"🚀 Using devices: {device_list}")
         processing_start = time.time()
         download_weight(args.model, args.model_dir)
-        result = _gpu_processing(frames_tensor, device_list, args)
+        result, lattice_entries = _gpu_processing(frames_tensor, device_list, args)
         generation_time = time.time() - processing_start
         
         if args.debug:
@@ -393,6 +433,10 @@ def main():
             print(f"📊 Peak VRAM usage: {torch.cuda.max_memory_allocated() / 1024**3:.2f}GB")
             print(f"📊 Result shape: {result.shape}, dtype: {result.dtype}")
         
+        lattice_json_path = None
+        overlay_source = None
+        overlay_save = None
+
         # After generation_time calculation, choose saving method
         if args.output_format == "png":
             # Ensure output treated as directory
@@ -404,6 +448,14 @@ def main():
             save_frames_to_png(result, output_dir, base_name, args.debug)
             if args.debug:
                 print(f"🔄 Save time: {time.time() - save_start:.2f}s")
+
+            if args.log_window_info:
+                total_frames = result.shape[0]
+                digits = max(5, len(str(total_frames)))
+                first_frame = Path(output_dir) / f"{base_name}_{0:0{digits}d}.png"
+                lattice_json_path = first_frame.with_name(f"{first_frame.stem}_lattice.json")
+                overlay_source = first_frame
+                overlay_save = first_frame.with_name(f"{first_frame.stem}_overlay.png")
         else:
             # Save video
             if args.debug:
@@ -412,7 +464,11 @@ def main():
             save_frames_to_video(result, args.output, original_fps, args.debug)
             if args.debug:
                 print(f"🔄 Save time: {time.time() - save_start:.2f}s")
-        
+
+            if args.log_window_info:
+                output_path_obj = Path(args.output)
+                lattice_json_path = output_path_obj.with_name(f"{output_path_obj.stem}_lattice.json")
+
         total_time = time.time() - start_time
         print(f"✅ Upscaling completed successfully!")
         if args.output_format == "png":
@@ -421,7 +477,39 @@ def main():
             print(f"📁 Output saved to video: {args.output}")
         print(f"🕒 Total processing time: {total_time:.2f}s")
         print(f"⚡ Average FPS: {len(frames_tensor) / generation_time:.2f} frames/sec")
-        
+
+        if args.log_window_info and lattice_json_path is not None:
+            try:
+                with open(lattice_json_path, "w", encoding="utf-8") as lattice_file:
+                    json.dump(lattice_entries, lattice_file, indent=2)
+                if args.debug:
+                    print(f"📝 Window lattice info saved to: {lattice_json_path}")
+            except OSError as exc:
+                print(f"⚠️ Failed to write lattice info: {exc}")
+
+        if args.make_window_overlay:
+            if args.output_format == "png" and overlay_source is not None and lattice_json_path is not None:
+                overlay_cmd = [
+                    sys.executable,
+                    "-m",
+                    "tools.overlay_windows",
+                    "--image",
+                    str(overlay_source),
+                    "--lattice",
+                    str(lattice_json_path),
+                    "--save",
+                    str(overlay_save if overlay_save is not None else overlay_source.with_name(f"{overlay_source.stem}_overlay.png")),
+                ]
+                if result.shape[0] > 1:
+                    print("ℹ️ Overlay will be generated for the first frame only (multiple frames detected).")
+                completed = subprocess.run(overlay_cmd, check=False)
+                if completed.returncode != 0:
+                    print("⚠️ Window overlay generation failed; see logs above for details.")
+            elif args.output_format == "png":
+                print("ℹ️ Window overlay requires --log_window_info to emit lattice metadata.")
+            elif args.output_format == "video":
+                print("ℹ️ Window overlay is currently available for still image outputs only.")
+
     except Exception as e:
         print(f"❌ Error during processing: {e}")
         import traceback

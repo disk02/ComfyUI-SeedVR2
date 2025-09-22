@@ -132,6 +132,9 @@ class NaDiT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        for idx, block in enumerate(self.blocks):
+            if hasattr(block, "set_layer_index"):
+                block.set_layer_index(idx, attention_variant="dit")
         self.vid_out = NaPatchOut(
             out_channels=vid_out_channels,
             patch_size=patch_size,

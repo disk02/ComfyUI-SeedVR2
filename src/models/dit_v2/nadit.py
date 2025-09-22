@@ -161,6 +161,9 @@ class NaDiT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        for idx, block in enumerate(self.blocks):
+            if hasattr(block, "set_layer_index"):
+                block.set_layer_index(idx, attention_variant="dit_v2")
 
         self.vid_out_norm = None
         if vid_out_norm is not None:
