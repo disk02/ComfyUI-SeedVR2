@@ -12,8 +12,9 @@ import random
 import shutil
 import subprocess
 import json
+import math
 import multiprocessing as mp
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 # Set up path before any other imports to fix module resolution
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -46,6 +47,8 @@ if platform.system() != "Darwin":
 import torch
 import cv2
 import numpy as np
+import imageio.v3 as iio
+from PIL import Image, ImageOps
 from datetime import datetime
 from pathlib import Path
 from src.utils.downloads import download_weight
@@ -185,6 +188,457 @@ def write_png_chunk(frames_uint8_rgb: np.ndarray, out_dir: str, start_idx: int) 
     for offset, frame in enumerate(frames_uint8_rgb):
         filename = os.path.join(out_dir, f"{start_idx + offset:06d}.png")
         iio.imwrite(filename, frame)
+
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def _is_image_file(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in IMAGE_EXTS
+
+
+def _iter_image_inputs(args) -> List[str]:
+    """Return a deterministic list of input image paths for image mode."""
+
+    single_image = getattr(args, "image_path", None)
+    legacy_single = getattr(args, "legacy_single_image", False)
+    if single_image and legacy_single:
+        return [single_image]
+    if single_image and not legacy_single:
+        return [single_image]
+
+    base_dir = getattr(args, "image_dir", None)
+    glob_pattern = getattr(args, "image_glob", None)
+    recursive = bool(getattr(args, "recursive", False))
+
+    candidates: List[str] = []
+    seen: Set[str] = set()
+
+    def _add_candidate(path_obj: Path) -> None:
+        if not path_obj.is_file():
+            return
+        resolved = str(path_obj.resolve())
+        if resolved in seen:
+            return
+        if not _is_image_file(resolved):
+            return
+        seen.add(resolved)
+        candidates.append(resolved)
+
+    if glob_pattern:
+        if base_dir:
+            base_path = Path(base_dir)
+            if not base_path.exists():
+                return [single_image] if single_image else []
+            iterator = base_path.rglob(glob_pattern) if recursive else base_path.glob(glob_pattern)
+        else:
+            cwd = Path.cwd()
+            if recursive and "**" not in glob_pattern:
+                iterator = cwd.rglob(glob_pattern)
+            else:
+                iterator = cwd.glob(glob_pattern)
+        for item in iterator:
+            _add_candidate(item)
+
+    if base_dir and not glob_pattern:
+        base_path = Path(base_dir)
+        if not base_path.exists():
+            return [single_image] if single_image else []
+        if recursive:
+            iterator = base_path.rglob("*")
+        else:
+            iterator = base_path.iterdir()
+        for item in iterator:
+            _add_candidate(item)
+
+    if not candidates and single_image:
+        return [single_image]
+
+    return sorted(candidates)
+
+
+def _approx_image_ram_bytes(h: int, w: int, channels: int = 3, dtype_bytes: int = 2) -> int:
+    """Rough fp16 RGB frame buffer size for a single image."""
+
+    return int(h) * int(w) * int(channels) * int(dtype_bytes)
+
+
+def _quality_1_to_100(value: str) -> int:
+    ivalue = int(value)
+    if ivalue < 1 or ivalue > 100:
+        raise argparse.ArgumentTypeError("quality must be between 1 and 100")
+    return ivalue
+
+
+def _warn_ignored_video_flags_in_image_mode(args) -> None:
+    """Emit a consolidated warning for video-only flags when running on a single image."""
+
+    ignored: list[str] = []
+
+    if getattr(args, "load_cap", None):
+        ignored.append("--load_cap")
+    if getattr(args, "temporal_overlap", None):
+        ignored.append("--temporal_overlap")
+    if getattr(args, "disable_streaming", False):
+        ignored.append("--disable_streaming")
+    if getattr(args, "no_audio_passthrough", False):
+        ignored.append("--no_audio_passthrough")
+    if getattr(args, "overwrite_audio_passthrough", False):
+        ignored.append("--overwrite_audio_passthrough")
+
+    if not ignored:
+        return
+
+    ordered_unique = list(dict.fromkeys(ignored))
+    print(f"[WARN] Image mode: ignoring video-only options: {', '.join(ordered_unique)}")
+
+
+def _validate_inputs(args) -> None:
+    """Ensure image/video arguments are used in valid combinations."""
+
+    has_video = bool(getattr(args, "video_path", None))
+    has_image_path = bool(getattr(args, "image_path", None))
+    has_batch = bool(getattr(args, "image_dir", None) or getattr(args, "image_glob", None))
+    legacy_single = bool(getattr(args, "legacy_single_image", False))
+
+    if not (has_video or has_image_path or has_batch):
+        raise SystemExit("[ERROR] Provide --video_path, --image_path, or image batch arguments.")
+
+    if has_video and (has_image_path or has_batch):
+        raise SystemExit("[ERROR] Video input cannot be combined with image arguments.")
+
+    if has_image_path and has_batch and not legacy_single:
+        raise SystemExit(
+            "[ERROR] --image_path cannot be combined with batch image options (use --legacy_single_image to override)."
+        )
+
+    if legacy_single and not (has_image_path or has_batch):
+        raise SystemExit("[ERROR] --legacy_single_image requires at least one image input.")
+
+    if getattr(args, "dry_run", False) and has_video:
+        raise SystemExit("[ERROR] --dry_run is only supported for image inputs.")
+
+    if getattr(args, "out_dir", None) and not (has_image_path or has_batch):
+        raise SystemExit("[ERROR] --out_dir applies to image mode only.")
+
+    if getattr(args, "image_format", None) and not (has_image_path or has_batch):
+        raise SystemExit("[ERROR] --image_format applies to image mode only.")
+
+    if has_batch:
+        output_arg = getattr(args, "output", None)
+        if output_arg:
+            _, ext = os.path.splitext(output_arg)
+            if ext:
+                raise SystemExit(
+                    "[ERROR] Batch image mode requires a directory for --output; use --out_dir or supply a directory path."
+                )
+
+
+def load_image_as_tensor(path: str) -> Tuple[torch.Tensor, bool]:
+    """Load an image as float16 RGB tensor [1, H, W, 3]; return flag if alpha was dropped."""
+
+    with Image.open(path) as img:
+        alpha_dropped = "A" in img.getbands()
+        try:
+            img = ImageOps.exif_transpose(img)
+        except Exception:
+            # If EXIF transpose fails, continue without altering the orientation.
+            pass
+        img = img.convert("RGB")
+        arr = np.asarray(img, dtype=np.float32)
+
+    arr = arr / 255.0
+    arr = arr.astype(np.float16, copy=False)
+    tensor = torch.from_numpy(arr).unsqueeze(0)
+    return tensor, alpha_dropped
+
+
+def _resolve_image_output_path(image_in: str, output_arg: str, preferred_format: str | None = None) -> str:
+    import os
+
+    if not output_arg:
+        raise ValueError("Image mode requires --output (file path or directory).")
+
+    root, ext = os.path.splitext(output_arg)
+    if ext:
+        lower = ext.lower()
+        if lower not in IMAGE_EXTS:
+            supported = ", ".join(sorted(IMAGE_EXTS))
+            raise ValueError(f"Unsupported image extension: {ext} (supported: {supported})")
+        if lower in IMAGE_EXTS:
+            out_dir = os.path.dirname(output_arg)
+            if out_dir and not os.path.exists(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
+            return output_arg
+
+    os.makedirs(output_arg, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(image_in))[0]
+    if preferred_format:
+        ext = "." + preferred_format.lower()
+    else:
+        ext = ".png"
+    return os.path.join(output_arg, f"{stem}_upscaled{ext}")
+
+
+def _resolve_batch_output_path(in_path: str, out_dir: str, fmt: str) -> str:
+    stem = os.path.splitext(os.path.basename(in_path))[0]
+    ext = "." + fmt.lower()
+    return os.path.join(out_dir, f"{stem}_upscaled{ext}")
+
+
+def _imageio_kwargs_for_path(out_path: str, args) -> Dict[str, Any]:
+    ext = os.path.splitext(out_path)[1].lower()
+    if ext in {".jpg", ".jpeg"}:
+        return {"quality": getattr(args, "jpeg_quality", 95)}
+    if ext == ".webp":
+        return {"quality": getattr(args, "webp_quality", 95)}
+    return {}
+
+
+def _run_single_image(args, image_path: str) -> None:
+    original_seed = args.seed
+    if original_seed == -1:
+        effective_seed = random.randint(0, 2**32 - 1)
+        print(
+            f"[INFO] Seed policy: randomize per image (--seed -1). Using seed {effective_seed} for this run."
+        )
+    else:
+        effective_seed = original_seed
+        print(f"[INFO] Seed policy: deterministic (seed={effective_seed}).")
+
+    args.seed = effective_seed
+
+    try:
+        frames_tensor, alpha_dropped = load_image_as_tensor(image_path)
+        frames_tensor = frames_tensor.contiguous()
+    except FileNotFoundError:
+        raise SystemExit(f"[ERROR] Input image not found: {image_path}")
+    except PermissionError:
+        raise SystemExit(f"[ERROR] Permission denied reading: {image_path}")
+    except Exception as exc:
+        raise SystemExit(f"[ERROR] Failed to load image: {exc}")
+
+    if alpha_dropped:
+        print("[INFO] Source had alpha; converted to RGB (alpha dropped).")
+
+    if frames_tensor.shape[-1] != 3:
+        raise SystemExit("[ERROR] Image mode expects RGB (3 channels) after load.")
+
+    in_h = int(frames_tensor.shape[1])
+    in_w = int(frames_tensor.shape[2])
+    if in_h < 1 or in_w < 1:
+        raise SystemExit("[ERROR] Invalid input image size.")
+
+    print(f"[INFO] Interpolation: resizing short side to {args.resolution} (preserving aspect ratio).")
+    approx_ram = _approx_image_ram_bytes(in_h, in_w)
+    print(
+        f"[INFO] Approx. RAM (frame buffer only; excludes activations) ≈ {approx_ram / 1024 / 1024:.1f} MiB (fp16 RGB)"
+    )
+
+    args.temporal_overlap = 0
+    args.batch_size = 1
+
+    download_weight(args.model, args.model_dir)
+
+    debug_obj = Debug(enabled=args.debug)
+
+    chunk_start = time.time()
+    runner = get_or_create_runner(args, debug_obj)
+    result_tensor = run_chunk_with_retry(
+        runner,
+        frames_tensor,
+        args,
+        debug_obj,
+    )
+    generation_time = time.time() - chunk_start
+
+    preferred_format = getattr(args, "image_format", None)
+    try:
+        out_path = _resolve_image_output_path(image_path, args.output, preferred_format=preferred_format)
+    except PermissionError:
+        raise SystemExit(f"[ERROR] Cannot create output directory/file: {args.output}")
+    except Exception as exc:
+        raise SystemExit(f"[ERROR] Invalid --output for image mode: {exc}")
+
+    imageio_kwargs = _imageio_kwargs_for_path(out_path, args)
+
+    try:
+        write_single_image(None, result_tensor, out_path, imageio_kwargs=imageio_kwargs)
+    except PermissionError:
+        raise SystemExit(f"[ERROR] Permission denied writing: {out_path}")
+    except Exception as exc:
+        raise SystemExit(f"[ERROR] Failed to write image: {exc}")
+
+    out_h, out_w = int(result_tensor.shape[1]), int(result_tensor.shape[2])
+    print(
+        f"[INFO] Image: {in_w}x{in_h} → {out_w}x{out_h}, seed={effective_seed}, wrote: {out_path}"
+    )
+    print(f"[INFO] Generation time: {generation_time:.3f}s")
+
+    args.seed = original_seed
+
+
+def _run_batch_images(args) -> None:
+    images = _iter_image_inputs(args)
+    if not images:
+        raise SystemExit("[ERROR] No images matched the provided arguments.")
+
+    if args.dry_run:
+        print(f"[DRY RUN] Matched {len(images)} file(s):")
+        for path in images:
+            print(f"  {path}")
+        return
+
+    output_dir = getattr(args, "out_dir", None)
+    if not output_dir:
+        if args.output and os.path.splitext(args.output)[1] == "":
+            output_dir = args.output
+        else:
+            output_dir = "./upscaled_images"
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    fmt = (getattr(args, "image_format", None) or "png").lower()
+
+    original_seed = args.seed
+    if original_seed >= 0:
+        print(f"[INFO] Seed policy: deterministic (seed={original_seed}) for all images.")
+    else:
+        print("[INFO] Seed policy: randomize per image (--seed -1).")
+
+    download_weight(args.model, args.model_dir)
+    args.temporal_overlap = 0
+    args.batch_size = 1
+    debug_obj = Debug(enabled=args.debug)
+    runner = get_or_create_runner(args, debug_obj)
+
+    total = len(images)
+    start_all = time.time()
+    errors: List[Tuple[str, str]] = []
+    processed = 0
+
+    for idx, path in enumerate(images, 1):
+        try:
+            frames_tensor, alpha_dropped = load_image_as_tensor(path)
+            frames_tensor = frames_tensor.contiguous()
+        except FileNotFoundError:
+            errors.append((path, "Input image not found"))
+            print(f"[WARN] Failed: {path} :: Input image not found")
+            continue
+        except PermissionError:
+            errors.append((path, "Permission denied reading"))
+            print(f"[WARN] Failed: {path} :: Permission denied reading")
+            continue
+        except Exception as exc:
+            errors.append((path, f"Failed to load image: {exc}"))
+            print(f"[WARN] Failed: {path} :: {exc}")
+            continue
+
+        if alpha_dropped:
+            print(f"[INFO] ({idx}/{total}) Source had alpha; converted to RGB (alpha dropped).")
+
+        if frames_tensor.shape[-1] != 3:
+            errors.append((path, "Expected 3-channel RGB after load"))
+            print(f"[WARN] Failed: {path} :: Expected 3-channel RGB after load")
+            continue
+
+        h = int(frames_tensor.shape[1])
+        w = int(frames_tensor.shape[2])
+        if h < 1 or w < 1:
+            errors.append((path, "Invalid input image size"))
+            print(f"[WARN] Failed: {path} :: Invalid input image size")
+            continue
+
+        print(f"[INFO] ({idx}/{total}) Interpolation: resizing short side to {args.resolution} (preserving aspect ratio).")
+        approx_ram = _approx_image_ram_bytes(h, w)
+        print(
+            f"[INFO] ({idx}/{total}) Approx. RAM per image (frame buffer only; excludes activations) ≈ {approx_ram / 1024 / 1024:.1f} MiB (fp16 RGB)"
+        )
+
+        effective_seed = original_seed
+        if original_seed < 0:
+            effective_seed = random.randint(0, 2**32 - 1)
+        args.seed = effective_seed
+
+        try:
+            t0 = time.time()
+            result_tensor = run_chunk_with_retry(runner, frames_tensor, args, debug_obj)
+            dt = time.time() - t0
+        except Exception as exc:
+            errors.append((path, str(exc)))
+            print(f"[WARN] Failed: {path} :: {exc}")
+            args.seed = original_seed
+            continue
+
+        out_path = _resolve_batch_output_path(path, output_dir, fmt)
+        imageio_kwargs = _imageio_kwargs_for_path(out_path, args)
+
+        try:
+            write_single_image(None, result_tensor, out_path, imageio_kwargs=imageio_kwargs)
+        except PermissionError:
+            errors.append((path, "Permission denied writing output"))
+            print(f"[WARN] Failed: {path} :: Permission denied writing output")
+            args.seed = original_seed
+            continue
+        except Exception as exc:
+            errors.append((path, f"Failed to write image: {exc}"))
+            print(f"[WARN] Failed: {path} :: {exc}")
+            args.seed = original_seed
+            continue
+
+        processed += 1
+        elapsed_all = time.time() - start_all
+        fps = processed / elapsed_all if elapsed_all > 0 else 0.0
+        remaining = total - processed
+        eta = remaining / fps if fps > 0 else math.inf
+        eta_display = f"{eta:.1f}s" if math.isfinite(eta) else "unknown"
+
+        out_h, out_w = int(result_tensor.shape[1]), int(result_tensor.shape[2])
+        basename = os.path.basename(path)
+        print(
+            f"[INFO] {idx}/{total}: {basename}  {w}x{h} → {out_w}x{out_h}, seed={effective_seed}, {dt:.2f}s → {out_path}"
+        )
+        print(
+            f"[INFO] Progress: {processed}/{total}  avg {fps:.2f} img/s  ETA ~{eta_display}"
+        )
+
+        args.seed = original_seed
+
+    duration = time.time() - start_all
+    success = total - len(errors)
+    throughput = success / duration if duration > 0 and success > 0 else 0.0
+    print(
+        f"[INFO] Done: {success}/{total} succeeded in {duration:.1f}s ({throughput:.2f} img/s)."
+    )
+    if errors:
+        print("[INFO] Failures:")
+        for path, message in errors:
+            print(f"  {path} :: {message}")
+
+    args.seed = original_seed
+
+
+def write_single_image(
+    tensor_fp16_rgb_TCHW: torch.Tensor | None,
+    tensor_fp16_rgb_THWC: torch.Tensor | None,
+    out_path: str,
+    *,
+    imageio_kwargs: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Write a single RGB image from fp16 tensors in [0, 1]."""
+
+    if tensor_fp16_rgb_THWC is None and tensor_fp16_rgb_TCHW is None:
+        raise ValueError("No image tensor provided")
+
+    if tensor_fp16_rgb_THWC is None:
+        x = tensor_fp16_rgb_TCHW.permute(0, 2, 3, 1).contiguous()
+    else:
+        x = tensor_fp16_rgb_THWC
+
+    x = x[0]
+    x = torch.clamp(x, 0.0, 1.0).mul(255.0).to(torch.uint8).cpu().numpy()
+    kwargs = imageio_kwargs or {}
+    iio.imwrite(out_path, x, **kwargs)
 
 debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
 
@@ -882,11 +1336,84 @@ class OneOrTwoValues(argparse.Action):
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="SeedVR2 Video Upscaler CLI")
-    
-    parser.add_argument("--video_path", type=str, required=True,
+
+    input_group = parser.add_mutually_exclusive_group(required=False)
+    input_group.add_argument("--video_path", type=str,
                         help="Path to input video file")
-    parser.add_argument("--seed", type=int, default=333,
-                        help="Random seed for reproducibility (default: 333). Use -1 for a random seed each run.")
+    input_group.add_argument(
+        "--image_path",
+        type=str,
+        help=(
+            "Path to an input image (PNG/JPG/JPEG/WEBP). Applies EXIF orientation, converts to RGB, and drops alpha."
+        ),
+    )
+    parser.add_argument(
+        "--image_dir",
+        type=str,
+        default=None,
+        help="Directory to scan for input images (image mode). Combine with --image_glob; non-recursive by default.",
+    )
+    parser.add_argument(
+        "--image_glob",
+        type=str,
+        default=None,
+        help="Glob pattern for image discovery (e.g., '*.png' or '**/*.jpg'). Relative to --image_dir when provided.",
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        default=False,
+        help="Recurse into subdirectories for --image_dir/--image_glob (image mode only).",
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default=None,
+        help=(
+            "Base directory for batch image outputs (image mode). Defaults to --output when it is a directory,"
+            " otherwise ./upscaled_images."
+        ),
+    )
+    parser.add_argument(
+        "--image_format",
+        type=str,
+        choices=["png", "jpg", "jpeg", "webp"],
+        default=None,
+        help="Image format for directory outputs (default: png). Applies to batch mode and single-image directories.",
+    )
+    parser.add_argument(
+        "--jpeg_quality",
+        type=_quality_1_to_100,
+        default=95,
+        help="JPEG quality (1-100, default: 95) for --image_format jpg/jpeg outputs.",
+    )
+    parser.add_argument(
+        "--webp_quality",
+        type=_quality_1_to_100,
+        default=95,
+        help="WebP quality (1-100, default: 95) for --image_format webp outputs.",
+    )
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        default=False,
+        help="List matching images and exit without loading models (image mode only).",
+    )
+    parser.add_argument(
+        "--legacy_single_image",
+        action="store_true",
+        default=False,
+        help="Force single-image processing even when batch image arguments are supplied (debugging aid).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=333,
+        help=(
+            "Random seed for reproducibility (default: 333). Use --seed -1 to randomize (per image in batch mode)."
+            " Values ≥0 (e.g., --seed 1234) yield deterministic results."
+        ),
+    )
     parser.add_argument("--resolution", type=int, default=1072,
                         help="Target resolution of the short side (default: 1072)")
     parser.add_argument("--batch_size", type=int, default=1,
@@ -907,8 +1434,15 @@ def parse_arguments():
                         help="Maximum frames in RAM at once; video is processed in multiple chunks until EOF.")
     parser.add_argument("--fps", type=float, default=None,
                         help="Override output FPS; defaults to the probed source FPS when unset.")
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output path (default: auto-generated, if output_format is png, it will be a directory)")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help=(
+            "Output path. For videos, behaves as before. In image mode, accepts an image filename (.png/.jpg/.jpeg/.webp)"
+            " or a directory (writes <stem>_upscaled.<format>). Batch mode prefers --out_dir."
+        ),
+    )
     parser.add_argument("--output_format", type=str, default="video", choices=["video", "png"],
                         help="Output format: 'video' (mp4) or 'png' images (default: video)")
     parser.add_argument("--no_audio_passthrough", action="store_true", default=False,
@@ -940,7 +1474,9 @@ def parse_arguments():
                         help="VAE tile size (default: 512). Use single integer or two integers 'h w'. Only used if --vae_tiling_enabled is set")
     parser.add_argument("--vae_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
                         help="VAE tile overlap (default: 128). Use single integer or two integers 'h w'. Only used if --vae_tiling_enabled is set")
-    return parser.parse_args()
+    args = parser.parse_args()
+    _validate_inputs(args)
+    return args
 
 
 def main():
@@ -950,6 +1486,34 @@ def main():
     # Parse arguments
     args = parse_arguments()
     debug.enabled = args.debug
+
+    using_image_mode = bool(
+        getattr(args, "image_path", None)
+        or getattr(args, "image_dir", None)
+        or getattr(args, "image_glob", None)
+    )
+
+    if using_image_mode:
+        _warn_ignored_video_flags_in_image_mode(args)
+
+        if getattr(args, "legacy_single_image", False):
+            images = _iter_image_inputs(args)
+            if not images:
+                raise SystemExit("[ERROR] No images matched the provided arguments.")
+            if len(images) > 1 and not getattr(args, "image_path", None):
+                print(
+                    f"[WARN] --legacy_single_image enabled; processing first of {len(images)} images: {images[0]}"
+                )
+            _run_single_image(args, images[0])
+            return
+
+        if getattr(args, "image_dir", None) or getattr(args, "image_glob", None):
+            _run_batch_images(args)
+            return
+
+        if getattr(args, "image_path", None):
+            _run_single_image(args, args.image_path)
+            return
 
     try:
         meta = probe_video_meta(args.video_path)
