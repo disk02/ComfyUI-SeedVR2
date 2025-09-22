@@ -192,6 +192,12 @@ def write_png_chunk(frames_uint8_rgb: np.ndarray, out_dir: str, start_idx: int) 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
+def _approx_image_ram_bytes(h: int, w: int, channels: int = 3, dtype_bytes: int = 2) -> int:
+    """Rough fp16 RGB frame buffer size for a single image."""
+
+    return int(h) * int(w) * int(channels) * int(dtype_bytes)
+
+
 def _warn_ignored_video_flags_in_image_mode(args) -> None:
     """Emit a consolidated warning for video-only flags when running on a single image."""
 
@@ -201,18 +207,25 @@ def _warn_ignored_video_flags_in_image_mode(args) -> None:
         ignored.append("--load_cap")
     if getattr(args, "temporal_overlap", None):
         ignored.append("--temporal_overlap")
+    if getattr(args, "disable_streaming", False):
+        ignored.append("--disable_streaming")
     if getattr(args, "no_audio_passthrough", False):
         ignored.append("--no_audio_passthrough")
     if getattr(args, "overwrite_audio_passthrough", False):
         ignored.append("--overwrite_audio_passthrough")
-    if getattr(args, "disable_streaming", False):
-        ignored.append("--disable_streaming")
 
     if not ignored:
         return
 
-    unique_flags = sorted(set(ignored))
-    print(f"[WARN] Image mode: ignoring video-only options: {', '.join(unique_flags)}")
+    ordered_unique = list(dict.fromkeys(ignored))
+    print(f"[WARN] Image mode: ignoring video-only options: {', '.join(ordered_unique)}")
+
+
+def _validate_inputs(args) -> None:
+    """Ensure exactly one input mode is selected."""
+
+    if bool(getattr(args, "image_path", None)) == bool(getattr(args, "video_path", None)):
+        raise SystemExit("[ERROR] Exactly one of --image_path or --video_path is required.")
 
 
 def load_image_as_tensor(path: str) -> torch.Tensor:
@@ -240,11 +253,16 @@ def _resolve_image_output_path(image_in: str, output_arg: str) -> str:
         raise ValueError("Image mode requires --output (file path or directory).")
 
     root, ext = os.path.splitext(output_arg)
-    if ext.lower() in IMAGE_EXTS:
-        out_dir = os.path.dirname(output_arg)
-        if out_dir and not os.path.exists(out_dir):
-            os.makedirs(out_dir, exist_ok=True)
-        return output_arg
+    if ext:
+        lower = ext.lower()
+        if lower not in IMAGE_EXTS:
+            supported = ", ".join(sorted(IMAGE_EXTS))
+            raise ValueError(f"Unsupported image extension: {ext} (supported: {supported})")
+        if lower in IMAGE_EXTS:
+            out_dir = os.path.dirname(output_arg)
+            if out_dir and not os.path.exists(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
+            return output_arg
 
     os.makedirs(output_arg, exist_ok=True)
     stem = os.path.splitext(os.path.basename(image_in))[0]
@@ -975,8 +993,14 @@ def parse_arguments():
         type=str,
         help="Path to an input image (PNG/JPG/JPEG/WEBP). Applies EXIF orientation, converts to RGB, and drops alpha.",
     )
-    parser.add_argument("--seed", type=int, default=333,
-                        help="Random seed for reproducibility (default: 333). Use -1 for a random seed each run.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=333,
+        help=(
+            "Random seed for reproducibility (default: 333). Provide -1 to randomize each run; values ≥0 yield deterministic output."
+        ),
+    )
     parser.add_argument("--resolution", type=int, default=1072,
                         help="Target resolution of the short side (default: 1072)")
     parser.add_argument("--batch_size", type=int, default=1,
@@ -1037,7 +1061,9 @@ def parse_arguments():
                         help="VAE tile size (default: 512). Use single integer or two integers 'h w'. Only used if --vae_tiling_enabled is set")
     parser.add_argument("--vae_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
                         help="VAE tile overlap (default: 128). Use single integer or two integers 'h w'. Only used if --vae_tiling_enabled is set")
-    return parser.parse_args()
+    args = parser.parse_args()
+    _validate_inputs(args)
+    return args
 
 
 def main():
@@ -1057,7 +1083,28 @@ def main():
 
         print(f"[INFO] Using seed {args.seed}")
 
-        frames_tensor = load_image_as_tensor(args.image_path).contiguous()
+        try:
+            frames_tensor = load_image_as_tensor(args.image_path).contiguous()
+        except FileNotFoundError:
+            raise SystemExit(f"[ERROR] Input image not found: {args.image_path}")
+        except PermissionError:
+            raise SystemExit(f"[ERROR] Permission denied reading: {args.image_path}")
+        except Exception as exc:
+            raise SystemExit(f"[ERROR] Failed to load image: {exc}")
+
+        if frames_tensor.shape[-1] != 3:
+            raise SystemExit("[ERROR] Image mode expects RGB (3 channels) after load.")
+
+        in_h = int(frames_tensor.shape[1])
+        in_w = int(frames_tensor.shape[2])
+        if in_h < 1 or in_w < 1:
+            raise SystemExit("[ERROR] Invalid input image size.")
+
+        print(f"[INFO] Interpolation: resizing short side to {args.resolution} (preserving aspect ratio).")
+        approx_ram = _approx_image_ram_bytes(in_h, in_w)
+        print(
+            f"[INFO] Approx. RAM (frame buffer only) ≈ {approx_ram / 1024 / 1024:.1f} MiB (fp16 RGB, excludes activations)"
+        )
 
         args.temporal_overlap = 0
         args.batch_size = 1
@@ -1078,13 +1125,18 @@ def main():
 
         try:
             out_path = _resolve_image_output_path(args.image_path, args.output)
-        except ValueError as exc:
-            print(f"[ERROR] {exc}")
-            sys.exit(1)
+        except PermissionError:
+            raise SystemExit(f"[ERROR] Cannot create output directory/file: {args.output}")
+        except Exception as exc:
+            raise SystemExit(f"[ERROR] Invalid --output for image mode: {exc}")
 
-        write_single_image(None, result_tensor, out_path)
+        try:
+            write_single_image(None, result_tensor, out_path)
+        except PermissionError:
+            raise SystemExit(f"[ERROR] Permission denied writing: {out_path}")
+        except Exception as exc:
+            raise SystemExit(f"[ERROR] Failed to write image: {exc}")
 
-        in_h, in_w = int(frames_tensor.shape[1]), int(frames_tensor.shape[2])
         out_h, out_w = int(result_tensor.shape[1]), int(result_tensor.shape[2])
         print(
             f"[INFO] Image: {in_w}x{in_h} → {out_w}x{out_h}, seed={args.seed}, wrote: {out_path}"
