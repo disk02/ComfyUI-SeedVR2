@@ -72,6 +72,8 @@ class NaSwinAttention(MMWindowAttention):
         self.window_logger: Optional[WindowLogger] = None
         self.adaptive_windows = adaptive_windows
         self.rope_apply_global = rope_apply_global
+        self._rope_default_policy = bool(rope_apply_global)
+        self._rope_logged = False
         self._window_plan_cache: Dict[
             Tuple[int, int, int, bool, torch.device, torch.dtype],
             WindowPlan,
@@ -87,8 +89,10 @@ class NaSwinAttention(MMWindowAttention):
         if adaptive_windows is not None and adaptive_windows != self.adaptive_windows:
             self.adaptive_windows = adaptive_windows
             cache_invalidated = True
-        if rope_apply_global is not None:
-            self.rope_apply_global = rope_apply_global
+        desired_rope = self._rope_default_policy if rope_apply_global is None else bool(rope_apply_global)
+        if desired_rope != self.rope_apply_global:
+            self.rope_apply_global = desired_rope
+            self._rope_logged = False
         if cache_invalidated:
             self._window_plan_cache.clear()
 
@@ -135,6 +139,23 @@ class NaSwinAttention(MMWindowAttention):
         latent_shape = tuple(int(v) for v in vid_shape[0].tolist())
         dt, dh, dw = latent_shape
         is_shifted = self.window_method == "720pswin_by_size_bysize"
+
+        if (
+            window_logger is not None
+            and getattr(window_logger, "_latest_plan", None) is None
+        ):
+            self._rope_logged = False
+
+        if (
+            window_logger is not None
+            and getattr(window_logger, "config", None)
+            and getattr(window_logger.config, "log_window_info", False)
+            and not self._rope_logged
+        ):
+            rope_impl = type(self.rope).__name__ if self.rope is not None else "None"
+            policy = "global_prewindow" if self.rope_apply_global else "per_window_restart"
+            print(f"[ROPE] policy={policy} impl={rope_impl}")
+            self._rope_logged = True
 
         if self.adaptive_windows:
             plan = self._get_adaptive_plan(dt, dh, dw, vid.device, vid.dtype, is_shifted)

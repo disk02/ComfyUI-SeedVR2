@@ -101,7 +101,7 @@ class VideoDiffusionInfer():
         *,
         force_adaptive_windows: bool = False,
         force_fixed_windows: bool = False,
-        rope_apply_global: bool = False,
+        rope_apply_global: Optional[bool] = None,
     ) -> None:
         if hasattr(self, "dit"):
             target = getattr(self.dit, "dit_model", self.dit)
@@ -121,13 +121,11 @@ class VideoDiffusionInfer():
         else:
             adaptive_windows = model_is_7b
 
-        rope_global = rope_apply_global or model_is_7b
-
         for module in target.modules():
             if hasattr(module, "set_runtime_window_flags"):
                 module.set_runtime_window_flags(
                     adaptive_windows=adaptive_windows,
-                    rope_apply_global=rope_global,
+                    rope_apply_global=rope_apply_global,
                 )
 
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
@@ -400,7 +398,7 @@ class VideoDiffusionInfer():
                     txt_shape=text_neg_shapes,
                     timestep=args.t.repeat(batch_size),
                 ).vid_sample,
-                scale=(
+                cfg_scale=(
                     cfg_scale
                     if (args.i + 1) / len(self.sampler.timesteps)
                     <= self.config.diffusion.cfg.get("partial", 1)

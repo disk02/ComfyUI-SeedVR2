@@ -16,6 +16,7 @@ Key Features:
 """
 
 import os
+from typing import Optional
 import torch
 from src.utils.constants import get_script_directory
 from omegaconf import OmegaConf
@@ -55,7 +56,7 @@ def configure_runner(
     *,
     force_adaptive_windows: bool = False,
     force_fixed_windows: bool = False,
-    rope_apply_global: bool = False,
+    rope_apply_global: Optional[bool] = None,
 ):
     """
     Configure and create a VideoDiffusionInfer runner for the specified model

@@ -16,7 +16,8 @@
 Utility functions.
 """
 
-from typing import Callable
+from typing import Callable, Optional
+from math import isclose
 import torch
 
 
@@ -62,23 +63,39 @@ def classifier_free_guidance(
     return cfg
 
 
+_cfg_once_logged = False
+
+
 def classifier_free_guidance_dispatcher(
-    pos: Callable,
-    neg: Callable,
-    scale: float,
+    *,
+    pos: Callable[[], torch.Tensor],
+    neg: Optional[Callable[[], torch.Tensor]] = None,
+    cfg_scale: Optional[float] = 1.0,
     rescale: float = 0.0,
 ):
-    """
-    Optionally execute models depending on classifer-free guidance scale.
-    """
-    # If scale is 1, no need to execute neg model.
-    if scale == 1.0:
-        return pos()
+    """Optionally execute models depending on classifier-free guidance scale."""
 
-    # Otherwise, execute both pos nad neg models and apply cfg.
+    global _cfg_once_logged
+
+    scale_value = 1.0 if cfg_scale is None else float(cfg_scale)
+
+    if not _cfg_once_logged:
+        try:
+            status = "disabled" if isclose(scale_value, 1.0) else f"enabled({scale_value:.2f})"
+            print(f"[CFG] dispatcher: {status}")
+        except Exception:
+            pass
+        _cfg_once_logged = True
+
+    cond = pos()
+
+    if neg is None or isclose(scale_value, 1.0):
+        return cond
+
+    uncond = neg()
     return classifier_free_guidance(
-        pos=pos(),
-        neg=neg(),
-        scale=scale,
+        pos=cond,
+        neg=uncond,
+        scale=scale_value,
         rescale=rescale,
     )

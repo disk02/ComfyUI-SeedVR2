@@ -69,6 +69,7 @@ def _ensure_tuple(value: Any) -> Tuple[int, ...]:
 
 def get_or_create_runner(args, debug_obj):
     """Cache and return an inference runner keyed by critical CLI arguments."""
+    rope_override = getattr(args, "rope_apply_global_override", None)
     key = (
         args.model,
         args.cuda_device if hasattr(args, "cuda_device") else None,
@@ -81,7 +82,7 @@ def get_or_create_runner(args, debug_obj):
         bool(getattr(args, "use_none_blocking", True)),
         bool(getattr(args, "force_adaptive_windows", False)),
         bool(getattr(args, "force_fixed_windows", False)),
-        bool(getattr(args, "rope_apply_global", False)),
+        "default" if rope_override is None else bool(rope_override),
     )
 
     window_logging_config = WindowLoggingConfig(
@@ -122,7 +123,7 @@ def get_or_create_runner(args, debug_obj):
         window_logging_config=window_logging_config,
         force_adaptive_windows=bool(getattr(args, "force_adaptive_windows", False)),
         force_fixed_windows=bool(getattr(args, "force_fixed_windows", False)),
-        rope_apply_global=bool(getattr(args, "rope_apply_global", False)),
+        rope_apply_global=rope_override,
     )
     _RUNNER_CACHE[key] = runner
     return runner
@@ -143,10 +144,14 @@ def _generation_with_runner(runner, model_in: torch.Tensor, batch_size: int, arg
     model_in = model_in.to(torch.float16)
     if hasattr(runner, "window_logger"):
         runner.window_logger.begin_capture()
+    cfg_value = getattr(args, "cfg_scale", 1.0)
+    if cfg_value is None:
+        cfg_value = 1.0
+
     return generation_loop(
         runner=runner,
         images=model_in,
-        cfg_scale=1.0,
+        cfg_scale=cfg_value,
         seed=args.seed,
         res_w=args.resolution,
         batch_size=effective_batch,
@@ -1214,7 +1219,7 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
         vae_tile_overlap=shared_args["vae_tile_overlap"],
         force_adaptive_windows=shared_args.get("force_adaptive_windows", False),
         force_fixed_windows=shared_args.get("force_fixed_windows", False),
-        rope_apply_global=shared_args.get("rope_apply_global", False),
+        rope_apply_global=shared_args.get("rope_apply_global_override", None),
     )
 
     # Run generation
@@ -1285,12 +1290,14 @@ def _gpu_processing(frames_tensor, device_list, args):
     return_queue = manager.Queue()
     workers = []
 
+    cfg_shared = getattr(args, "cfg_scale", None)
+
     shared_args = {
         "model": args.model,
         "model_dir": args.model_dir if args.model_dir is not None else "./models/SEEDVR2",
         "preserve_vram": args.preserve_vram,
         "debug": args.debug,
-        "cfg_scale": 1.0,
+        "cfg_scale": float(cfg_shared) if cfg_shared is not None else 1.0,
         "seed": args.seed,
         "res_w": args.resolution,
         "batch_size": args.batch_size,
@@ -1306,7 +1313,7 @@ def _gpu_processing(frames_tensor, device_list, args):
         "vae_tile_overlap": args.vae_tile_overlap,
         "force_adaptive_windows": bool(getattr(args, "force_adaptive_windows", False)),
         "force_fixed_windows": bool(getattr(args, "force_fixed_windows", False)),
-        "rope_apply_global": bool(getattr(args, "rope_apply_global", False)),
+        "rope_apply_global_override": getattr(args, "rope_apply_global_override", None),
     }
 
     for idx, (device_id, chunk_tensor) in enumerate(zip(device_list, chunks)):
@@ -1464,6 +1471,12 @@ def parse_arguments():
             " Values ≥0 (e.g., --seed 1234) yield deterministic results."
         ),
     )
+    parser.add_argument(
+        "--cfg_scale",
+        type=float,
+        default=3.5,
+        help="Classifier-free guidance scale (1.0 disables CFG). Typical: 2.5–5.0.",
+    )
     parser.add_argument("--resolution", type=int, default=1072,
                         help="Target resolution of the short side (default: 1072)")
     parser.add_argument("--batch_size", type=int, default=1,
@@ -1561,6 +1574,8 @@ def parse_arguments():
     parser.add_argument("--vae_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
                         help="VAE tile overlap (default: 128). Use single integer or two integers 'h w'. Only used if --vae_tiling_enabled is set")
     args = parser.parse_args()
+    rope_flag_explicit = any(arg == "--rope_apply_global" for arg in sys.argv[1:])
+    args.rope_apply_global_override = args.rope_apply_global if rope_flag_explicit else None
     if args.force_adaptive_windows and args.force_fixed_windows:
         parser.error("Choose either --force_adaptive_windows or --force_fixed_windows, not both.")
     _validate_inputs(args)
@@ -1574,6 +1589,11 @@ def main():
     # Parse arguments
     args = parse_arguments()
     debug.enabled = args.debug
+
+    if getattr(args, "cfg_scale", None) is not None:
+        cfg_enabled = not math.isclose(float(args.cfg_scale), 1.0)
+        status = "enabled" if cfg_enabled else "disabled"
+        print(f"[CFG] scale={float(args.cfg_scale):.2f} ({status})")
 
     using_image_mode = bool(
         getattr(args, "image_path", None)
