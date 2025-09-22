@@ -17,6 +17,8 @@ Key Features:
 """
 
 import os
+from typing import Optional
+
 import torch
 from src.utils.constants import get_script_directory
 from torchvision.transforms import Compose, Lambda, Normalize
@@ -298,9 +300,9 @@ def cut_videos(videos):
     return result
 
 
-def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_size=90, 
-                   preserve_vram=False, temporal_overlap=0, debug=None, 
-                   progress_callback=None):
+def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_size=90,
+                   preserve_vram=False, temporal_overlap=0, debug=None,
+                   progress_callback=None, vae_use_sample: Optional[bool] = None):
     """
     Main generation loop with context-aware temporal processing
     
@@ -315,6 +317,7 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
         temporal_overlap (int): Frames for temporal continuity
         debug (bool): Debug mode
         progress_callback (callable): Optional callback for progress reporting
+        vae_use_sample (bool, optional): Override VAE sampling on encode (True samples, False deterministic)
         
     Returns:
         torch.Tensor: Generated video frames
@@ -372,8 +375,14 @@ def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_si
         autocast_dtype = torch.bfloat16
 
     # Configure classifier-free guidance
-    runner.config.diffusion.cfg.scale = cfg_scale
+    if cfg_scale is None:
+        cfg_scale = runner.config.diffusion.cfg.scale
+    else:
+        runner.config.diffusion.cfg.scale = cfg_scale
     runner.config.diffusion.cfg.rescale = 0.0
+    # Configure VAE sampling behaviour when requested
+    if vae_use_sample is not None:
+        runner.config.vae.use_sample = bool(vae_use_sample)
     # Configure sampling steps
     runner.config.diffusion.timesteps.sampling.steps = 1
     runner.configure_diffusion(dtype=compute_dtype)

@@ -67,6 +67,22 @@ def _ensure_tuple(value: Any) -> Tuple[int, ...]:
     return (int(value),)
 
 
+def _str2bool(value: Any) -> bool:
+    """Parse common string representations of booleans for CLI flags."""
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+    value_lower = value.lower()
+    if value_lower in {"true", "1", "yes", "y", "on"}:
+        return True
+    if value_lower in {"false", "0", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"Cannot interpret '{value}' as boolean. Use true/false or 1/0."
+    )
+
+
 def get_or_create_runner(args, debug_obj):
     """Cache and return an inference runner keyed by critical CLI arguments."""
     key = (
@@ -94,6 +110,8 @@ def get_or_create_runner(args, debug_obj):
         runner = _RUNNER_CACHE[key]
         runner.debug = debug_obj
         runner.set_window_logging_config(window_logging_config)
+        if hasattr(runner.config, "vae"):
+            runner.config.vae.use_sample = bool(getattr(args, "vae_use_sample", True))
         return runner
 
     from src.core.model_manager import configure_runner
@@ -124,6 +142,8 @@ def get_or_create_runner(args, debug_obj):
         force_fixed_windows=bool(getattr(args, "force_fixed_windows", False)),
         rope_apply_global=bool(getattr(args, "rope_apply_global", False)),
     )
+    if hasattr(runner.config, "vae"):
+        runner.config.vae.use_sample = bool(getattr(args, "vae_use_sample", True))
     _RUNNER_CACHE[key] = runner
     return runner
 
@@ -146,13 +166,14 @@ def _generation_with_runner(runner, model_in: torch.Tensor, batch_size: int, arg
     return generation_loop(
         runner=runner,
         images=model_in,
-        cfg_scale=1.0,
+        cfg_scale=getattr(args, "cfg_scale", 1.0),
         seed=args.seed,
         res_w=args.resolution,
         batch_size=effective_batch,
         preserve_vram=getattr(args, "preserve_vram", False),
         temporal_overlap=getattr(args, "temporal_overlap", 0),
         debug=debug_obj,
+        vae_use_sample=getattr(args, "vae_use_sample", True),
     ).detach().to("cpu", dtype=torch.float16)
 
 
@@ -1217,6 +1238,9 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
         rope_apply_global=shared_args.get("rope_apply_global", False),
     )
 
+    if hasattr(runner.config, "vae"):
+        runner.config.vae.use_sample = bool(shared_args.get("vae_use_sample", True))
+
     # Run generation
     result_tensor = generation_loop(
         runner=runner,
@@ -1228,6 +1252,7 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
         preserve_vram=shared_args["preserve_vram"],
         temporal_overlap=shared_args["temporal_overlap"],
         debug=worker_debug,
+        vae_use_sample=shared_args.get("vae_use_sample", True),
     )
 
     # Send back result as numpy array to avoid CUDA transfers
@@ -1290,7 +1315,7 @@ def _gpu_processing(frames_tensor, device_list, args):
         "model_dir": args.model_dir if args.model_dir is not None else "./models/SEEDVR2",
         "preserve_vram": args.preserve_vram,
         "debug": args.debug,
-        "cfg_scale": 1.0,
+        "cfg_scale": args.cfg_scale,
         "seed": args.seed,
         "res_w": args.resolution,
         "batch_size": args.batch_size,
@@ -1307,6 +1332,7 @@ def _gpu_processing(frames_tensor, device_list, args):
         "force_adaptive_windows": bool(getattr(args, "force_adaptive_windows", False)),
         "force_fixed_windows": bool(getattr(args, "force_fixed_windows", False)),
         "rope_apply_global": bool(getattr(args, "rope_apply_global", False)),
+        "vae_use_sample": args.vae_use_sample,
     }
 
     for idx, (device_id, chunk_tensor) in enumerate(zip(device_list, chunks)):
@@ -1464,6 +1490,12 @@ def parse_arguments():
             " Values ≥0 (e.g., --seed 1234) yield deterministic results."
         ),
     )
+    parser.add_argument(
+        "--cfg_scale",
+        type=float,
+        default=6.5,
+        help="Classifier-free guidance scale (default: 6.5).",
+    )
     parser.add_argument("--resolution", type=int, default=1072,
                         help="Target resolution of the short side (default: 1072)")
     parser.add_argument("--batch_size", type=int, default=1,
@@ -1503,6 +1535,16 @@ def parse_arguments():
                         help="Fallback to legacy single-shot mode (for debugging).")
     parser.add_argument("--preserve_vram", action="store_true",
                         help="Enable VRAM preservation mode")
+    parser.add_argument(
+        "--vae_use_sample",
+        type=_str2bool,
+        default=True,
+        metavar="{true,false}",
+        help=(
+            "If true (default), sample from the VAE posterior during encode; "
+            "set false for deterministic VAE encodes."
+        ),
+    )
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     parser.add_argument(

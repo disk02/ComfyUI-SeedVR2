@@ -17,7 +17,7 @@
 Euler ODE solver.
 """
 
-from typing import Callable
+from typing import Callable, Optional
 import torch
 from einops import rearrange
 from torch.nn import functional as F
@@ -40,60 +40,54 @@ class EulerSampler(Sampler):
         self,
         x: torch.Tensor,
         f: Callable[[SamplerModelArgs], torch.Tensor],
+        *,
+        cfg_scale: Optional[float] = None,
+        vae_use_sample: Optional[bool] = None,
     ) -> torch.Tensor:
-        timesteps = self.timesteps.timesteps
+        timesteps = self.timesteps.timesteps.to(device=x.device, dtype=x.dtype)
         progress = self.get_progress_bar()
         i = 0
-        
-        # Optimisations VRAM
-        original_dtype = x.dtype
-        device = x.device
-        
-        # Forcer FP16 pour économiser la VRAM
-        if x.dtype != torch.float16:
-            x = x.half()
-        
+
+        dtype = x.dtype
+
+        if not getattr(self, "_sampler_banner_logged", False):
+            total_steps = max(len(timesteps) - 1, 0)
+            cfg_value = cfg_scale if cfg_scale is not None else "None"
+            vae_value = (
+                bool(vae_use_sample)
+                if vae_use_sample is not None
+                else "None"
+            )
+            print(
+                f"[SAMPLER] algo=Euler steps={total_steps} dtype={dtype} "
+                f"cfg_scale={cfg_value} vae_use_sample={vae_value}"
+            )
+            self._sampler_banner_logged = True
+
         for t, s in zip(timesteps[:-1], timesteps[1:]):
-            # Forcer FP16 pour les timesteps
-            if t.dtype != torch.float16:
-                t = t.half()
-            if s.dtype != torch.float16:
-                s = s.half()
-                
-            # Appel du modèle avec monitoring
             pred = f(SamplerModelArgs(x, t, i))
-            
-            # Forcer FP16 pour la prédiction
-            if pred.dtype != torch.float16:
-                pred = pred.half()
-            
-            # Étape suivante
+
+            if pred.dtype != dtype:
+                pred = pred.to(dtype)
+
             x = self.step_to(pred, x, t, s)
-            
-            # Nettoyer les tenseurs temporaires
+
             del pred
 
-            # Clear memory - only when model is configured with sampling step > 1
-            clear_memory(debug=getattr(self, 'debug', None), deep=False, force=True)
-            
+            clear_memory(debug=getattr(self, "debug", None), deep=False, force=True)
+
             i += 1
             progress.update()
 
-        if self.return_endpoint:
+        if self.return_endpoint and len(timesteps) > 0:
             t = timesteps[-1]
-            if t.dtype != torch.float16:
-                t = t.half()
             pred = f(SamplerModelArgs(x, t, i))
-            if pred.dtype != torch.float16:
-                pred = pred.half()
+            if pred.dtype != dtype:
+                pred = pred.to(dtype)
             x = self.get_endpoint(pred, x, t)
             del pred
             progress.update()
-        
-        # Restaurer le dtype original si nécessaire
-        if original_dtype != torch.float16:
-            x = x.to(original_dtype)
-            
+
         return x
 
     def step(

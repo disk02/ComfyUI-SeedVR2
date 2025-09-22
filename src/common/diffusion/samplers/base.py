@@ -18,7 +18,7 @@ Sampler base class.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional
 import torch
 from tqdm import tqdm
 
@@ -61,6 +61,9 @@ class Sampler(ABC):
         self,
         x: torch.Tensor,
         f: Callable[[SamplerModelArgs], torch.Tensor],
+        *,
+        cfg_scale: Optional[float] = None,
+        vae_use_sample: Optional[bool] = None,
     ) -> torch.Tensor:
         """
         Generate a new sample given the the intial sample x and score function f.

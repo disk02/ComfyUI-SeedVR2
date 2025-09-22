@@ -408,6 +408,8 @@ class VideoDiffusionInfer():
                 ),
                 rescale=self.config.diffusion.cfg.rescale,
             ),
+            cfg_scale=cfg_scale,
+            vae_use_sample=self.config.vae.get("use_sample", True),
         )
         
         self.debug.end_timer("dit_inference", "DiT inference")

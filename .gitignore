@@ -3,6 +3,7 @@
 tests/*
 !tests/test_device_selection.py
 !tests/test_windows.py
+!tests/test_sampler_dtype_and_cfg.py
 .vscode/
 .cursor/
 benchmark/
@@ -20,6 +21,7 @@ vram_diagnostic.py
 test_*.py
 !tests/test_device_selection.py
 !tests/test_windows.py
+!tests/test_sampler_dtype_and_cfg.py
 VRAM_OPTIMIZATIONS_SUMMARY.md
 seedvr2.py
 src/core/isolated_generation.py

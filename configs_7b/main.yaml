@@ -84,7 +84,7 @@ diffusion:
   loss:
     type: v_lerp
   cfg:
-    scale: 7.5
+    scale: 6.5
     rescale: 0
 
 condition:
