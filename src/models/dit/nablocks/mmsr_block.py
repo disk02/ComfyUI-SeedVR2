@@ -12,7 +12,7 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
-from typing import Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 import torch
 from einops import rearrange
 from torch.nn import functional as F
@@ -28,7 +28,8 @@ from ..mm import MMArg
 from ..modulation import ada_layer_type
 from ..normalization import norm_layer_type
 from ..rope import NaRotaryEmbedding3d
-from ..window import get_window_op
+from ..window import WindowPlan, compute_adaptive_windows, get_window_op
+from ....utils.window_logging import WindowLogger, plan_from_slices
 from ....common.half_precision_fixes import safe_pad_operation
 
 class NaSwinAttention(MMWindowAttention):
@@ -45,6 +46,9 @@ class NaSwinAttention(MMWindowAttention):
         window: Union[int, Tuple[int, int, int]],
         window_method: str,
         shared_qkv: bool,
+        *,
+        adaptive_windows: bool = True,
+        rope_apply_global: bool = True,
         **kwargs,
     ):
         super().__init__(
@@ -63,6 +67,57 @@ class NaSwinAttention(MMWindowAttention):
         self.rope = NaRotaryEmbedding3d(dim=head_dim // 2) if qk_rope else None
         self.attn = FlashAttentionVarlen()
         self.window_op = get_window_op(window_method)
+        self._log_regular_window_op = get_window_op("720pwin_by_size_bysize")
+        self._log_shifted_window_op = get_window_op("720pswin_by_size_bysize")
+        self.window_logger: Optional[WindowLogger] = None
+        self.adaptive_windows = adaptive_windows
+        self.rope_apply_global = rope_apply_global
+        self._window_plan_cache: Dict[
+            Tuple[int, int, int, bool, torch.device, torch.dtype],
+            WindowPlan,
+        ] = {}
+
+    def set_runtime_window_flags(
+        self,
+        *,
+        adaptive_windows: Optional[bool] = None,
+        rope_apply_global: Optional[bool] = None,
+    ) -> None:
+        cache_invalidated = False
+        if adaptive_windows is not None and adaptive_windows != self.adaptive_windows:
+            self.adaptive_windows = adaptive_windows
+            cache_invalidated = True
+        if rope_apply_global is not None:
+            self.rope_apply_global = rope_apply_global
+        if cache_invalidated:
+            self._window_plan_cache.clear()
+
+    def _get_adaptive_plan(
+        self,
+        dt: int,
+        dh: int,
+        dw: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        is_shifted: bool,
+    ) -> WindowPlan:
+        key = (dt, dh, dw, is_shifted, device, dtype)
+        plan = self._window_plan_cache.get(key)
+        if plan is None:
+            target_nh = max(1, int(self.window[1]))
+            target_nw = max(1, int(self.window[2]))
+            plan = compute_adaptive_windows(
+                dt,
+                dh,
+                dw,
+                target_nh=target_nh,
+                target_nw=target_nw,
+            )
+            base_key = (dt, dh, dw, False, device, dtype)
+            shifted_key = (dt, dh, dw, True, device, dtype)
+            self._window_plan_cache[base_key] = plan
+            self._window_plan_cache[shifted_key] = plan
+        return plan
 
     def forward(
         self,
@@ -75,6 +130,36 @@ class NaSwinAttention(MMWindowAttention):
         torch.FloatTensor,
         torch.FloatTensor,
     ]:
+
+        window_logger = getattr(self, "window_logger", None)
+        latent_shape = tuple(int(v) for v in vid_shape[0].tolist())
+        dt, dh, dw = latent_shape
+        is_shifted = self.window_method == "720pswin_by_size_bysize"
+
+        if self.adaptive_windows:
+            plan = self._get_adaptive_plan(dt, dh, dw, vid.device, vid.dtype, is_shifted)
+            regular_slices = list(plan.slices.regular)
+            shifted_slices = list(plan.slices.shifted)
+            slices_for_variant = shifted_slices if is_shifted else regular_slices
+            if window_logger is not None and window_logger.enabled:
+                plan_dump = plan_from_slices(latent_shape, regular_slices, shifted_slices)
+                window_logger.process(
+                    "adaptive",
+                    latent_shape,
+                    regular_slices,
+                    shifted_slices,
+                    plan=plan_dump,
+                    proxy_hw=(plan.proxy_h, plan.proxy_w),
+                )
+        else:
+            base_window = tuple(int(v) for v in self.window)
+            regular_slices = list(self._log_regular_window_op(latent_shape, base_window))
+            shifted_slices = list(self._log_shifted_window_op(latent_shape, base_window))
+            slices_for_variant = list(self.window_op(latent_shape, base_window))
+            if window_logger is not None and window_logger.enabled:
+                window_logger.process("fixed", latent_shape, regular_slices, shifted_slices)
+
+        slices_for_variant = list(slices_for_variant)
 
         vid_qkv, txt_qkv = self.proj_qkv(vid, txt)
         vid_qkv = gather_seq_scatter_heads_qkv(
@@ -90,28 +175,38 @@ class NaSwinAttention(MMWindowAttention):
             cache=cache.namespace("txt"),
         )
 
-        # re-org the input seq for window attn
+        vid_qkv = rearrange(vid_qkv, "l (o h d) -> l o h d", o=3, d=self.head_dim)
+        txt_qkv = rearrange(txt_qkv, "l (o h d) -> l o h d", o=3, d=self.head_dim)
+
+        vid_q, vid_k, vid_v = vid_qkv.unbind(1)
+        txt_q, txt_k, txt_v = txt_qkv.unbind(1)
+
+        vid_q, txt_q = self.norm_q(vid_q, txt_q)
+        vid_k, txt_k = self.norm_k(vid_k, txt_k)
+
+        if self.rope and self.rope_apply_global:
+            cache_global = cache.namespace("global_rope")
+            vid_q, vid_k = self.rope(vid_q, vid_k, vid_shape, cache_global)
+
+        concat_vid = torch.stack((vid_q, vid_k, vid_v), dim=1)
+        concat_vid = rearrange(concat_vid, "l o h d -> l (o h d)")
+
         cache_win = cache.namespace(f"{self.window_method}_{self.window}_sd3")
 
-        def make_window(x: torch.Tensor):
-            t, h, w, _ = x.shape
-            window_slices = self.window_op((t, h, w), self.window)
-            return [x[st, sh, sw] for (st, sh, sw) in window_slices]
+        def make_window(x: torch.Tensor, slices=slices_for_variant):
+            return [x[st, sh, sw] for (st, sh, sw) in slices]
 
         window_partition, window_reverse, window_shape, window_count = cache_win(
             "win_transform",
             lambda: na.window_idx(vid_shape, make_window),
         )
-        vid_qkv_win = window_partition(vid_qkv)
+        vid_qkv_win = window_partition(concat_vid)
 
         vid_qkv_win = rearrange(vid_qkv_win, "l (o h d) -> l o h d", o=3, d=self.head_dim)
-        txt_qkv = rearrange(txt_qkv, "l (o h d) -> l o h d", o=3, d=self.head_dim)
-
         vid_q, vid_k, vid_v = vid_qkv_win.unbind(1)
-        txt_q, txt_k, txt_v = txt_qkv.unbind(1)
 
-        vid_q, txt_q = self.norm_q(vid_q, txt_q)
-        vid_k, txt_k = self.norm_k(vid_k, txt_k)
+        if self.rope and not self.rope_apply_global:
+            vid_q, vid_k = self.rope(vid_q, vid_k, window_shape, cache_win)
 
         txt_len = cache("txt_len", lambda: txt_shape.prod(-1))
 
@@ -121,10 +216,6 @@ class NaSwinAttention(MMWindowAttention):
         concat_win, unconcat_win = cache_win(
             "mm_pnp", lambda: na.repeat_concat_idx(vid_len_win, txt_len, window_count)
         )
-
-        # window rope
-        if self.rope:
-            vid_q, vid_k = self.rope(vid_q, vid_k, window_shape, cache_win)
 
         out = self.attn(
             q=concat_win(vid_q, txt_q).bfloat16(),

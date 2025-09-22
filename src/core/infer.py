@@ -18,6 +18,11 @@ from einops import rearrange
 from omegaconf import DictConfig, ListConfig
 from torch import Tensor
 from src.optimization.memory_manager import clear_memory, manage_model_device
+from src.utils.window_logging import (
+    WindowLogger,
+    WindowLoggingConfig,
+    attach_window_logger,
+)
 
 from src.common.diffusion import (
     classifier_free_guidance_dispatcher,
@@ -77,7 +82,54 @@ class VideoDiffusionInfer():
         self.vae_tiling_enabled = vae_tiling_enabled
         self.vae_tile_size = vae_tile_size
         self.vae_tile_overlap = vae_tile_overlap
-        
+        self.window_logger = WindowLogger(WindowLoggingConfig())
+
+    def set_window_logging_config(self, config: Optional[WindowLoggingConfig]) -> None:
+        config = config or WindowLoggingConfig()
+        self.window_logger.update_config(config)
+        if hasattr(self, "dit"):
+            target = getattr(self.dit, "dit_model", self.dit)
+            attach_window_logger(target, self.window_logger)
+
+    def refresh_window_logger_bindings(self) -> None:
+        if hasattr(self, "dit"):
+            target = getattr(self.dit, "dit_model", self.dit)
+            attach_window_logger(target, self.window_logger)
+
+    def set_window_runtime_flags(
+        self,
+        *,
+        force_adaptive_windows: bool = False,
+        force_fixed_windows: bool = False,
+        rope_apply_global: bool = False,
+    ) -> None:
+        if hasattr(self, "dit"):
+            target = getattr(self.dit, "dit_model", self.dit)
+        else:
+            return
+
+        model_name = getattr(self, "_model_name", "") or ""
+        model_is_7b = "7b" in model_name.lower()
+
+        if force_adaptive_windows and force_fixed_windows:
+            raise ValueError("force_adaptive_windows and force_fixed_windows cannot both be True")
+
+        if force_adaptive_windows:
+            adaptive_windows = True
+        elif force_fixed_windows:
+            adaptive_windows = False
+        else:
+            adaptive_windows = model_is_7b
+
+        rope_global = rope_apply_global or model_is_7b
+
+        for module in target.modules():
+            if hasattr(module, "set_runtime_window_flags"):
+                module.set_runtime_window_flags(
+                    adaptive_windows=adaptive_windows,
+                    rope_apply_global=rope_global,
+                )
+
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
         t, h, w, c = latent.shape
         cond = torch.zeros([t, h, w, c + 1], device=latent.device, dtype=latent.dtype)

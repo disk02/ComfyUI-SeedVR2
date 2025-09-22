@@ -53,6 +53,7 @@ from datetime import datetime
 from pathlib import Path
 from src.utils.downloads import download_weight
 from src.utils.debug import Debug
+from src.utils.window_logging import WindowLoggingConfig
 
 
 _RUNNER_CACHE: Dict[Tuple[Any, ...], Any] = {}
@@ -78,10 +79,22 @@ def get_or_create_runner(args, debug_obj):
         int(getattr(args, "blocks_to_swap", 0)),
         bool(getattr(args, "offload_io_components", False)),
         bool(getattr(args, "use_none_blocking", True)),
+        bool(getattr(args, "force_adaptive_windows", False)),
+        bool(getattr(args, "force_fixed_windows", False)),
+        bool(getattr(args, "rope_apply_global", False)),
+    )
+
+    window_logging_config = WindowLoggingConfig(
+        log_window_info=bool(getattr(args, "log_window_info", False)),
+        dump_window_plan=getattr(args, "dump_window_plan", None),
+        make_window_overlay=bool(getattr(args, "make_window_overlay", False)),
     )
 
     if key in _RUNNER_CACHE:
-        return _RUNNER_CACHE[key]
+        runner = _RUNNER_CACHE[key]
+        runner.debug = debug_obj
+        runner.set_window_logging_config(window_logging_config)
+        return runner
 
     from src.core.model_manager import configure_runner
 
@@ -106,6 +119,10 @@ def get_or_create_runner(args, debug_obj):
         vae_tiling_enabled=getattr(args, "vae_tiling_enabled", False),
         vae_tile_size=getattr(args, "vae_tile_size", 0),
         vae_tile_overlap=getattr(args, "vae_tile_overlap", 0),
+        window_logging_config=window_logging_config,
+        force_adaptive_windows=bool(getattr(args, "force_adaptive_windows", False)),
+        force_fixed_windows=bool(getattr(args, "force_fixed_windows", False)),
+        rope_apply_global=bool(getattr(args, "rope_apply_global", False)),
     )
     _RUNNER_CACHE[key] = runner
     return runner
@@ -124,6 +141,8 @@ def _generation_with_runner(runner, model_in: torch.Tensor, batch_size: int, arg
 
     effective_batch = max(1, int(batch_size))
     model_in = model_in.to(torch.float16)
+    if hasattr(runner, "window_logger"):
+        runner.window_logger.begin_capture()
     return generation_loop(
         runner=runner,
         images=model_in,
@@ -469,6 +488,14 @@ def _run_single_image(args, image_path: str) -> None:
     except Exception as exc:
         raise SystemExit(f"[ERROR] Failed to write image: {exc}")
 
+    if getattr(args, "make_window_overlay", False) and hasattr(runner, "window_logger"):
+        overlay_path = runner.window_logger.maybe_make_overlay(out_path)
+        if overlay_path:
+            print(f"[INFO] Window overlay: {overlay_path}")
+        elif not getattr(runner.window_logger, "_overlay_warned", False):
+            print("[WARN] Window overlay requested but no window plan was captured.")
+            runner.window_logger._overlay_warned = True
+
     out_h, out_w = int(result_tensor.shape[1]), int(result_tensor.shape[2])
     print(
         f"[INFO] Image: {in_w}x{in_h} → {out_w}x{out_h}, seed={effective_seed}, wrote: {out_path}"
@@ -585,6 +612,14 @@ def _run_batch_images(args) -> None:
             print(f"[WARN] Failed: {path} :: {exc}")
             args.seed = original_seed
             continue
+
+        if getattr(args, "make_window_overlay", False) and hasattr(runner, "window_logger"):
+            overlay_path = runner.window_logger.maybe_make_overlay(out_path)
+            if overlay_path:
+                print(f"[INFO] Window overlay: {overlay_path}")
+            elif not getattr(runner.window_logger, "_overlay_warned", False):
+                print("[WARN] Window overlay requested but no window plan was captured.")
+                runner.window_logger._overlay_warned = True
 
         processed += 1
         elapsed_all = time.time() - start_all
@@ -1168,7 +1203,19 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
     # ensure model weights present (each process checks but very fast if already downloaded)
     worker_debug.log(f"Configuring runner for device {device_id}", category="setup")
     # BlockSwap wiring: nightly expects config here (configure_runner), not generation_loop.
-    runner = configure_runner(model_name, model_dir, shared_args["preserve_vram"], worker_debug, block_swap_config=shared_args["block_swap_config"], vae_tiling_enabled=shared_args["vae_tiling_enabled"], vae_tile_size=shared_args["vae_tile_size"], vae_tile_overlap=shared_args["vae_tile_overlap"])
+    runner = configure_runner(
+        model_name,
+        model_dir,
+        shared_args["preserve_vram"],
+        worker_debug,
+        block_swap_config=shared_args["block_swap_config"],
+        vae_tiling_enabled=shared_args["vae_tiling_enabled"],
+        vae_tile_size=shared_args["vae_tile_size"],
+        vae_tile_overlap=shared_args["vae_tile_overlap"],
+        force_adaptive_windows=shared_args.get("force_adaptive_windows", False),
+        force_fixed_windows=shared_args.get("force_fixed_windows", False),
+        rope_apply_global=shared_args.get("rope_apply_global", False),
+    )
 
     # Run generation
     result_tensor = generation_loop(
@@ -1257,6 +1304,9 @@ def _gpu_processing(frames_tensor, device_list, args):
         "vae_tiling_enabled": args.vae_tiling_enabled,
         "vae_tile_size": args.vae_tile_size,
         "vae_tile_overlap": args.vae_tile_overlap,
+        "force_adaptive_windows": bool(getattr(args, "force_adaptive_windows", False)),
+        "force_fixed_windows": bool(getattr(args, "force_fixed_windows", False)),
+        "rope_apply_global": bool(getattr(args, "rope_apply_global", False)),
     }
 
     for idx, (device_id, chunk_tensor) in enumerate(zip(device_list, chunks)):
@@ -1455,6 +1505,42 @@ def parse_arguments():
                         help="Enable VRAM preservation mode")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
+    parser.add_argument(
+        "--log_window_info",
+        action="store_true",
+        default=False,
+        help="Log latent/window sizes and counts for each attention block (opt-in).",
+    )
+    parser.add_argument(
+        "--dump_window_plan",
+        type=str,
+        default=None,
+        help="Write a JSON dump describing the final window lattice (opt-in).",
+    )
+    parser.add_argument(
+        "--make_window_overlay",
+        action="store_true",
+        default=False,
+        help="Generate a *_windows.png overlay using the last window plan (image mode).",
+    )
+    parser.add_argument(
+        "--force_adaptive_windows",
+        action="store_true",
+        default=False,
+        help="Force adaptive window attention regardless of model defaults.",
+    )
+    parser.add_argument(
+        "--force_fixed_windows",
+        action="store_true",
+        default=False,
+        help="Force legacy fixed (720p) window attention regardless of model defaults.",
+    )
+    parser.add_argument(
+        "--rope_apply_global",
+        action="store_true",
+        default=False,
+        help="Apply mm-aware RoPE across the full latent grid before windowing.",
+    )
     if platform.system() != "Darwin":
         parser.add_argument("--cuda_device", type=str, default=None,
                         help="CUDA device id(s). Single id (e.g., '0') or comma-separated list '0,1' for multi-GPU")
@@ -1475,6 +1561,8 @@ def parse_arguments():
     parser.add_argument("--vae_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
                         help="VAE tile overlap (default: 128). Use single integer or two integers 'h w'. Only used if --vae_tiling_enabled is set")
     args = parser.parse_args()
+    if args.force_adaptive_windows and args.force_fixed_windows:
+        parser.error("Choose either --force_adaptive_windows or --force_fixed_windows, not both.")
     _validate_inputs(args)
     return args
 
