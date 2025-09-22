@@ -25,6 +25,13 @@ def _axis_from_3d(slices3d, axis: str):
     raise ValueError(axis)
 
 
+def _count_tokens_3d(slices3d):
+    return sum(
+        (t.stop - t.start) * (h.stop - h.start) * (w.stop - w.start)
+        for (t, h, w) in slices3d
+    )
+
+
 def _assert_no_tiny_borders(plan):
     h_segments = _axis_from_3d(plan.slices.regular, "H")
     w_segments = _axis_from_3d(plan.slices.regular, "W")
@@ -35,12 +42,9 @@ def _assert_no_tiny_borders(plan):
 
 
 def _assert_shifted_covers(plan):
-    h_regular = _axis_from_3d(plan.slices.regular, "H")
-    w_regular = _axis_from_3d(plan.slices.regular, "W")
-    h_shifted = _axis_from_3d(plan.slices.shifted, "H")
-    w_shifted = _axis_from_3d(plan.slices.shifted, "W")
-    assert len(h_shifted) >= len(h_regular), f"shifted nh {len(h_shifted)} < regular nh {len(h_regular)}"
-    assert len(w_shifted) >= len(w_regular), f"shifted nw {len(w_shifted)} < regular nw {len(w_regular)}"
+    expected = plan.dt * plan.dh * plan.dw
+    assert _count_tokens_3d(plan.slices.regular) == expected
+    assert _count_tokens_3d(plan.slices.shifted) == expected
 
 
 @pytest.mark.parametrize("out", [1024, 1536, 1920, 2048])
@@ -79,4 +83,28 @@ def test_smoke_message():
         f"(nt,nh,nw)=({plan.nt},{plan.nh},{plan.nw})"
     )
     assert isinstance(msg, str) and msg
+
+
+def test_shifted_is_partition_1920():
+    plan = compute_adaptive_windows(1, 120, 120)
+    expected = plan.dt * plan.dh * plan.dw
+    assert _count_tokens_3d(plan.slices.regular) == expected
+    assert _count_tokens_3d(plan.slices.shifted) == expected
+
+
+@pytest.mark.parametrize("dh,dw", [(64, 64), (96, 120), (120, 96), (128, 128), (117, 131)])
+def test_shifted_is_partition_various(dh, dw):
+    plan = compute_adaptive_windows(1, dh, dw)
+    expected = plan.dt * plan.dh * plan.dw
+    assert _count_tokens_3d(plan.slices.regular) == expected
+    assert _count_tokens_3d(plan.slices.shifted) == expected
+
+
+def test_shifted_axis_contiguity():
+    plan = compute_adaptive_windows(1, 120, 96)
+    h_segments = sorted({(h.start, h.stop) for (_, h, _) in plan.slices.shifted})
+    assert h_segments[0][0] == 0
+    assert h_segments[-1][1] == plan.dh
+    for (a0, a1), (b0, b1) in zip(h_segments, h_segments[1:]):
+        assert a1 == b0
 

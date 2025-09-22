@@ -100,43 +100,31 @@ def _grid_regular(L: int, target_size: int) -> Tuple[List[Tuple[int, int]], int,
 
 
 def _grid_shifted(L: int, rep_size: int) -> List[Tuple[int, int]]:
-    """
-    Shifted grid: start at offset = rep_size//2 (if more than one segment plausible),
-    tile with stride=rep_size; truncate/extend last to cover L. If the last segment
-    would be tiny (< rep_size//2) and there's at least one previous, merge it.
-    """
+    """Return a non-overlapping shifted partition of ``[0, L)``."""
 
     if L <= rep_size:
         return [(0, L)]
+
     start = rep_size // 2
     segs: List[Tuple[int, int]] = []
+
+    if start > 0:
+        segs.append((0, start))
+
     cur = start
-    while cur < L:
-        end = min(L, cur + rep_size)
-        segs.append((cur, end))
+    while cur + rep_size <= L:
+        segs.append((cur, cur + rep_size))
         cur += rep_size
-    # Ensure last segment is not tiny: merge if needed
-    half = int(math.ceil(rep_size / 2))
-    if len(segs) >= 2:
-        last_len = segs[-1][1] - segs[-1][0]
-        if last_len < half:
-            prev0, prev1 = segs[-2]
-            segs[-2] = (prev0, segs[-1][1])
-            segs.pop()
-    # Ensure we cover from 0 with a shifted grid; if not, prepend one at head
-    if segs and segs[0][0] > 0:
-        # Add a head segment [0, min(rep_size, L)]
-        head_end = min(rep_size, L)
-        segs.insert(0, (0, head_end))
-        # Also ensure no tiny strip now:
-        if len(segs) >= 2:
-            first_len = segs[0][1] - segs[0][0]
-            if first_len < half:
-                # merge with next
-                a0, a1 = segs[0]
-                b0, b1 = segs[1]
-                segs[0] = (0, b1)
-                segs.pop(1)
+
+    if cur < L:
+        tail_len = L - cur
+        half = int(math.ceil(rep_size / 2))
+        if tail_len < half and segs:
+            head, _ = segs[-1]
+            segs[-1] = (head, L)
+        else:
+            segs.append((cur, L))
+
     return segs
 
 
@@ -151,6 +139,13 @@ def _cartesian_3d(
             for w0, w1 in ws:
                 out.append((slice(t0, t1), slice(h0, h1), slice(w0, w1)))
     return out
+
+
+def _count_tokens_3d(slices3d: List[Tuple[slice, slice, slice]]) -> int:
+    return sum(
+        (t.stop - t.start) * (h.stop - h.start) * (w.stop - w.start)
+        for (t, h, w) in slices3d
+    )
 
 
 # -------------------------
@@ -205,6 +200,16 @@ def compute_adaptive_windows(
     # Compose 3D
     regular_3d = _cartesian_3d(t_regular, h_regular, w_regular)
     shifted_3d = _cartesian_3d(t_regular, h_shifted, w_shifted)
+
+    expected_tokens = d_t * d_h * d_w
+    regular_tokens = _count_tokens_3d(regular_3d)
+    shifted_tokens = _count_tokens_3d(shifted_3d)
+    assert (
+        regular_tokens == expected_tokens
+    ), (regular_tokens, expected_tokens, "regular coverage mismatch")
+    assert (
+        shifted_tokens == expected_tokens
+    ), (shifted_tokens, expected_tokens, "shifted coverage mismatch")
 
     return WindowPlan(
         dt=d_t,
