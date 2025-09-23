@@ -101,6 +101,7 @@ class VideoDiffusionInfer():
         *,
         force_adaptive_windows: bool = False,
         force_fixed_windows: bool = False,
+        rope_apply_global_override: Optional[bool] = None,
         rope_apply_global: Optional[bool] = None,
     ) -> None:
         if hasattr(self, "dit"):
@@ -121,11 +122,17 @@ class VideoDiffusionInfer():
         else:
             adaptive_windows = model_is_7b
 
+        rope_override = (
+            rope_apply_global_override
+            if rope_apply_global_override is not None
+            else rope_apply_global
+        )
+
         for module in target.modules():
             if hasattr(module, "set_runtime_window_flags"):
                 module.set_runtime_window_flags(
                     adaptive_windows=adaptive_windows,
-                    rope_apply_global=rope_apply_global,
+                    rope_apply_global_override=rope_override,
                 )
 
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:

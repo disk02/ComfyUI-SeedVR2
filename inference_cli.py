@@ -54,9 +54,11 @@ from pathlib import Path
 from src.utils.downloads import download_weight
 from src.utils.debug import Debug
 from src.utils.window_logging import WindowLoggingConfig
+from src.common.logger import get_logger
 
 
 _RUNNER_CACHE: Dict[Tuple[Any, ...], Any] = {}
+logger = get_logger(__name__)
 
 
 def _ensure_tuple(value: Any) -> Tuple[int, ...]:
@@ -123,7 +125,7 @@ def get_or_create_runner(args, debug_obj):
         window_logging_config=window_logging_config,
         force_adaptive_windows=bool(getattr(args, "force_adaptive_windows", False)),
         force_fixed_windows=bool(getattr(args, "force_fixed_windows", False)),
-        rope_apply_global=rope_override,
+        rope_apply_global_override=rope_override,
     )
     _RUNNER_CACHE[key] = runner
     return runner
@@ -1219,7 +1221,7 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
         vae_tile_overlap=shared_args["vae_tile_overlap"],
         force_adaptive_windows=shared_args.get("force_adaptive_windows", False),
         force_fixed_windows=shared_args.get("force_fixed_windows", False),
-        rope_apply_global=shared_args.get("rope_apply_global_override", None),
+        rope_apply_global_override=shared_args.get("rope_apply_global_override", None),
     )
 
     # Run generation
@@ -1550,10 +1552,17 @@ def parse_arguments():
     )
     parser.add_argument(
         "--rope_apply_global",
+        dest="rope_apply_global",
         action="store_true",
-        default=False,
-        help="Apply mm-aware RoPE across the full latent grid before windowing.",
+        help="Force-enable global pre-window RoPE.",
     )
+    parser.add_argument(
+        "--no_rope_apply_global",
+        dest="rope_apply_global",
+        action="store_false",
+        help="Force-disable global pre-window RoPE.",
+    )
+    parser.set_defaults(rope_apply_global=None)
     if platform.system() != "Darwin":
         parser.add_argument("--cuda_device", type=str, default=None,
                         help="CUDA device id(s). Single id (e.g., '0') or comma-separated list '0,1' for multi-GPU")
@@ -1574,8 +1583,7 @@ def parse_arguments():
     parser.add_argument("--vae_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
                         help="VAE tile overlap (default: 128). Use single integer or two integers 'h w'. Only used if --vae_tiling_enabled is set")
     args = parser.parse_args()
-    rope_flag_explicit = any(arg == "--rope_apply_global" for arg in sys.argv[1:])
-    args.rope_apply_global_override = args.rope_apply_global if rope_flag_explicit else None
+    args.rope_apply_global_override = args.rope_apply_global
     if args.force_adaptive_windows and args.force_fixed_windows:
         parser.error("Choose either --force_adaptive_windows or --force_fixed_windows, not both.")
     _validate_inputs(args)
@@ -1594,6 +1602,12 @@ def main():
         cfg_enabled = not math.isclose(float(args.cfg_scale), 1.0)
         status = "enabled" if cfg_enabled else "disabled"
         print(f"[CFG] scale={float(args.cfg_scale):.2f} ({status})")
+
+    rope_override = getattr(args, "rope_apply_global_override", None)
+    if rope_override is None:
+        logger.info("[ROPE] override=None (using model default)")
+    else:
+        logger.info(f"[ROPE] override={rope_override}")
 
     using_image_mode = bool(
         getattr(args, "image_path", None)

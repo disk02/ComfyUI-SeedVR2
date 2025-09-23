@@ -173,13 +173,19 @@ class NaSwinAttention(NaMMAttention):
         self,
         *,
         adaptive_windows: Optional[bool] = None,
+        rope_apply_global_override: Optional[bool] = None,
         rope_apply_global: Optional[bool] = None,
     ) -> None:
         cache_invalidated = False
         if adaptive_windows is not None and adaptive_windows != self.adaptive_windows:
             self.adaptive_windows = adaptive_windows
             cache_invalidated = True
-        desired_rope = self._rope_default_policy if rope_apply_global is None else bool(rope_apply_global)
+        override = (
+            rope_apply_global_override
+            if rope_apply_global_override is not None
+            else rope_apply_global
+        )
+        desired_rope = self._rope_default_policy if override is None else bool(override)
         if desired_rope != self.rope_apply_global:
             self.rope_apply_global = desired_rope
             self._rope_logged = False

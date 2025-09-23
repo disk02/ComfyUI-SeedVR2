@@ -56,6 +56,7 @@ def configure_runner(
     *,
     force_adaptive_windows: bool = False,
     force_fixed_windows: bool = False,
+    rope_apply_global_override: Optional[bool] = None,
     rope_apply_global: Optional[bool] = None,
 ):
     """
@@ -83,6 +84,12 @@ def configure_runner(
     if debug is None:
         raise ValueError("Debug instance must be provided to configure_runner")
     
+    rope_override = (
+        rope_apply_global_override
+        if rope_apply_global_override is not None
+        else rope_apply_global
+    )
+
     # Check if we can reuse the cached runner
     if cached_runner and cache_model:
         # Update all runtime parameters dynamically
@@ -139,7 +146,7 @@ def configure_runner(
         cached_runner.set_window_runtime_flags(
             force_adaptive_windows=force_adaptive_windows,
             force_fixed_windows=force_fixed_windows,
-            rope_apply_global=rope_apply_global,
+            rope_apply_global_override=rope_override,
         )
         return cached_runner
         
@@ -236,7 +243,7 @@ def configure_runner(
     runner.set_window_runtime_flags(
         force_adaptive_windows=force_adaptive_windows,
         force_fixed_windows=force_fixed_windows,
-        rope_apply_global=rope_apply_global,
+        rope_apply_global_override=rope_override,
     )
     return runner
 

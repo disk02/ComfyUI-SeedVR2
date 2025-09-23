@@ -287,6 +287,12 @@ options:
 
 ```
 
+#### RoPE policy overrides
+
+- `--rope_apply_global`: Force-enable global pre-window RoPE (matches the original 7B default).
+- `--no_rope_apply_global`: Force-disable global pre-window RoPE for per-window restarts.
+- If neither flag is provided, the model default is used and reported in the `[ROPE] override=...` startup log.
+
 Examples :
 
 ```
