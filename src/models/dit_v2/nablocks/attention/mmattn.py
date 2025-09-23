@@ -148,7 +148,7 @@ class NaSwinAttention(NaMMAttention):
         window: Union[int, Tuple[int, int, int]],
         window_method: str,
         adaptive_windows: bool = False,
-        rope_apply_global: bool = False,
+        rope_apply_global: Optional[bool] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -161,8 +161,8 @@ class NaSwinAttention(NaMMAttention):
         self._log_shifted_window_op = get_window_op("720pswin_by_size_bysize")
         self.window_logger: Optional[WindowLogger] = None
         self.adaptive_windows = adaptive_windows
-        self.rope_apply_global = rope_apply_global
-        self._rope_default_policy = bool(rope_apply_global)
+        self._rope_default_policy = True if rope_apply_global is None else bool(rope_apply_global)
+        self.rope_apply_global = self._rope_default_policy
         self._rope_logged = False
         self._window_plan_cache: Dict[
             Tuple[int, int, int, bool, torch.device, torch.dtype],
@@ -248,7 +248,11 @@ class NaSwinAttention(NaMMAttention):
             and getattr(window_logger.config, "log_window_info", False)
             and not self._rope_logged
         ):
-            rope_impl = type(self.rope).__name__ if self.rope is not None else "None"
+            rope_impl = (
+                getattr(self.rope, "log_name", type(self.rope).__name__)
+                if self.rope is not None
+                else "None"
+            )
             policy = "global_prewindow" if self.rope_apply_global else "per_window_restart"
             print(f"[ROPE] policy={policy} impl={rope_impl}")
             self._rope_logged = True

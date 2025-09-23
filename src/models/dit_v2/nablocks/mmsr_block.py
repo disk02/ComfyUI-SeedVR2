@@ -66,6 +66,7 @@ class NaMMSRTransformerBlock(nn.Module):
             shared_weights=shared_weights,
             window=kwargs.pop("window", None),
             window_method=kwargs.pop("window_method", None),
+            rope_apply_global=kwargs.pop("rope_apply_global", None),
         )
 
         self.mlp_norm = MMModule(norm, dim=dim, eps=norm_eps, elementwise_affine=False, shared_weights=shared_weights, vid_only=is_last_layer)
