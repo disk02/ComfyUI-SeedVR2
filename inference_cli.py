@@ -341,10 +341,34 @@ def _validate_inputs(args) -> None:
     if halo < 0:
         raise SystemExit("[ERROR] --window_halo_latent must be a non-negative integer (latent pixels).")
 
+    min_value = float(getattr(args, "spatial_blend_min", 1e-4))
+    if min_value < 0.0 or min_value >= 1.0:
+        raise SystemExit("[ERROR] --spatial_blend_min must be in the range [0, 1).")
+
+    tukey_alpha = float(getattr(args, "tukey_alpha", 0.5))
+    if tukey_alpha < 0.0 or tukey_alpha > 1.0:
+        raise SystemExit("[ERROR] --tukey_alpha must be between 0.0 and 1.0.")
+
+    softmax_tau = float(getattr(args, "softmax_tau", 8.0))
+    if softmax_tau <= 0.0:
+        raise SystemExit("[ERROR] --softmax_tau must be a positive value.")
+
+    post_norm_groups = int(getattr(args, "post_stitch_gn_groups", 16))
+    if post_norm_groups <= 0:
+        raise SystemExit("[ERROR] --post_stitch_gn_groups must be a positive integer.")
+
 
 def _configure_spatial_blend(args) -> None:
     policy = getattr(args, "spatial_blend", "hann")
     margin = max(0, int(getattr(args, "spatial_blend_margin", 24)))
+    min_value = max(0.0, float(getattr(args, "spatial_blend_min", 1e-4)))
+    tukey_alpha = float(getattr(args, "tukey_alpha", 0.5))
+    tukey_alpha = min(max(tukey_alpha, 0.0), 1.0)
+    softmax_tau = float(getattr(args, "softmax_tau", 8.0))
+    softmax_tau = max(softmax_tau, 1e-6)
+    post_norm = str(getattr(args, "post_stitch_norm", "none"))
+    post_norm_groups = max(1, int(getattr(args, "post_stitch_gn_groups", 16)))
+    debug_enabled = bool(getattr(args, "debug", False))
 
     try:
         from src.models.dit.window import set_spatial_blend as set_spatial_blend_v1
@@ -356,13 +380,31 @@ def _configure_spatial_blend(args) -> None:
     except ImportError:
         set_spatial_blend_v2 = None
 
+    setter_kwargs = {
+        "min_value": min_value,
+        "tukey_alpha": tukey_alpha,
+        "softmax_tau": softmax_tau,
+        "post_stitch_norm": post_norm,
+        "post_stitch_gn_groups": post_norm_groups,
+        "debug_enabled": debug_enabled,
+    }
+
     if set_spatial_blend_v1 is not None:
-        set_spatial_blend_v1(policy, margin)
+        set_spatial_blend_v1(policy, margin, **setter_kwargs)
     if set_spatial_blend_v2 is not None:
-        set_spatial_blend_v2(policy, margin)
+        set_spatial_blend_v2(policy, margin, **setter_kwargs)
+
+    extras: List[str] = [f"min={min_value:.4f}"]
+    if policy == "tukey":
+        extras.append(f"alpha={tukey_alpha:.3f}")
+    elif policy == "softmax":
+        extras.append(f"tau={softmax_tau:.3f}")
+    extras.append(f"post_norm={post_norm}")
+    if post_norm == "groupnorm":
+        extras.append(f"groups={post_norm_groups}")
 
     debug.log(
-        f"Spatial blend policy: {policy} (margin={margin})",
+        f"Spatial blend policy: {policy} (margin={margin}, {', '.join(extras)})",
         category="dit",
         force=True,
     )
@@ -394,7 +436,7 @@ def _configure_window_halo(args) -> None:
 
     policy = getattr(args, "spatial_blend", "hann")
     margin = max(0, int(getattr(args, "spatial_blend_margin", 24)))
-    if policy == "hann" and margin > halo:
+    if policy in {"hann", "tukey", "softmax"} and margin > halo:
         debug.log(
             f"[WARN] spatial_blend_margin ({margin}) exceeds window_halo_latent ({halo}); taper clipped to halo.",
             category="dit",
@@ -1534,7 +1576,7 @@ def parse_arguments():
                         help="Temporal overlap for processing (default: 0, no temporal overlap)")
     parser.add_argument(
         "--spatial_blend",
-        choices=["off", "hann"],
+        choices=["off", "hann", "tukey", "softmax"],
         default="hann",
         help="Spatial blending policy for window stitching (default: hann).",
     )
@@ -1545,10 +1587,40 @@ def parse_arguments():
         help="Spatial blending margin in latent pixels (range: 8-48).",
     )
     parser.add_argument(
+        "--spatial_blend_min",
+        type=float,
+        default=1e-4,
+        help="Minimum floor applied to spatial blend weights (default: 1e-4).",
+    )
+    parser.add_argument(
+        "--tukey_alpha",
+        type=float,
+        default=0.5,
+        help="Tukey window alpha (0.0-1.0); only used with --spatial_blend tukey.",
+    )
+    parser.add_argument(
+        "--softmax_tau",
+        type=float,
+        default=8.0,
+        help="Softmax temperature for spatial blending (only for --spatial_blend softmax).",
+    )
+    parser.add_argument(
         "--window_halo_latent",
         type=int,
         default=16,
         help="Spatial halo overlap per side in latent pixels (0 disables overlap).",
+    )
+    parser.add_argument(
+        "--post_stitch_norm",
+        choices=["none", "layernorm", "groupnorm"],
+        default="none",
+        help="Optional post-stitch normalization applied to blended features.",
+    )
+    parser.add_argument(
+        "--post_stitch_gn_groups",
+        type=int,
+        default=16,
+        help="Group count for post-stitch group normalization (if enabled).",
     )
     parser.add_argument("--prepend_frames", type=int, default=0,
                         help="Number of frames to prepend to the video (default: 0). This can help with artifacts at the start of the video and are removed after processing")

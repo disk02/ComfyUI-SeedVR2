@@ -14,8 +14,11 @@
 
 from itertools import chain
 from typing import Callable, Dict, List, Sequence, Tuple
+import math
+
 import einops
 import torch
+import torch.nn.functional as F
 
 from .window import get_spatial_blend_settings, make_spatial_blend_mask
 
@@ -332,16 +335,25 @@ def _window_reverse(
     sample_lookup: List[int] | None,
     halo_lookup: List[Tuple[int, int, int, int]] | None,
 ) -> torch.Tensor:
-    policy, margin = get_spatial_blend_settings()
+    settings = get_spatial_blend_settings()
+    policy = settings.get("policy", "off")
+    margin = int(settings.get("margin", 0))
+    min_value = float(settings.get("min_value", 1e-3))
+    tukey_alpha = float(settings.get("tukey_alpha", 0.5))
+    softmax_tau = float(settings.get("softmax_tau", 8.0))
+    post_norm = str(settings.get("post_stitch_norm", "none"))
+    post_norm_groups = int(settings.get("post_stitch_gn_groups", 16))
+    debug_enabled = bool(settings.get("debug", False))
+
     if (
-        policy != "hann"
-        or margin <= 0
+        policy == "off"
         or window_shapes is None
         or sample_shapes is None
         or not slice_lookup
         or sample_lookup is None
         or halo_lookup is None
         or hid.numel() == 0
+        or (margin <= 0 and policy != "softmax")
     ):
         return torch.index_select(hid, 0, src_idx)
 
@@ -349,7 +361,7 @@ def _window_reverse(
     hid_flat = hid.reshape(hid.shape[0], -1)
     orig_len = sample_shapes.prod(-1).sum().item()
 
-    out_flat = hid_flat.new_zeros((orig_len, hid_flat.shape[1]))
+    accum_flat = hid_flat.new_zeros((orig_len, hid_flat.shape[1]))
     weight_flat = hid_flat.new_zeros(orig_len)
 
     window_sizes = window_shapes.prod(-1).tolist()
@@ -363,6 +375,10 @@ def _window_reverse(
         else:
             stop = int(s.stop)
         return start, stop
+
+    softmax_mode = policy == "softmax"
+    tau_denom = max(softmax_tau, 1e-6)
+    max_halo_value = 0
 
     for idx, (chunk, idx_vec) in enumerate(zip(chunks, idx_chunks)):
         sample_idx = sample_lookup[idx]
@@ -383,19 +399,76 @@ def _window_reverse(
         )
         if side_margins == (0, 0, 0, 0):
             side_margins = None
-        mask = make_spatial_blend_mask(
+        else:
+            halo_candidates = [max(int(v), 0) for v in halo_offsets]
+            max_halo_value = max(max_halo_value, *halo_candidates)
+
+        blend = make_spatial_blend_mask(
             win_shape,
             sample_shape,
             norm_slice,
             margin,
             device=hid.device,
             dtype=hid.dtype,
+            policy=policy,
+            min_value=min_value,
+            tukey_alpha=tukey_alpha,
             side_margins=side_margins,
         )
-        mask_flat = mask.reshape(-1)
-        weighted = chunk * mask_flat.unsqueeze(-1)
-        out_flat.index_add_(0, idx_vec, weighted)
-        weight_flat.index_add_(0, idx_vec, mask_flat)
 
-    out_flat = out_flat / torch.clamp(weight_flat.unsqueeze(-1), min=1e-6)
-    return out_flat.reshape((orig_len,) + feature_shape)
+        if blend.policy == "softmax":
+            closeness_flat = blend.closeness.reshape(-1)
+            logits = (-closeness_flat.to(torch.float32) / tau_denom).clamp(min=-60.0)
+            weights = torch.exp(logits).to(chunk.dtype)
+            weighted = chunk * weights.unsqueeze(-1)
+            accum_flat.index_add_(0, idx_vec, weighted)
+            weight_flat.index_add_(0, idx_vec, weights.to(weight_flat.dtype))
+        else:
+            mask_flat = torch.clamp(blend.mask.reshape(-1), min=min_value)
+            weighted = chunk * mask_flat.unsqueeze(-1)
+            accum_flat.index_add_(0, idx_vec, weighted)
+            weight_flat.index_add_(0, idx_vec, mask_flat.to(weight_flat.dtype))
+
+    denom = torch.clamp(weight_flat.unsqueeze(-1), min=1e-6)
+    out_flat = accum_flat / denom
+
+    if debug_enabled:
+        stat_tensor = weight_flat
+        if stat_tensor.numel() > 0:
+            w_min = float(stat_tensor.min().item())
+            w_mean = float(stat_tensor.mean().item())
+            w_max = float(stat_tensor.max().item())
+        else:
+            w_min = w_mean = w_max = 0.0
+        stat_label = "den" if softmax_mode else "WACC"
+        extra = (
+            f"tau={tau_denom:.3f}"
+            if softmax_mode
+            else f"alpha={tukey_alpha:.3f}"
+        )
+        print(
+            (
+                f"[DEBUG][spatial_blend] policy={policy} margin={margin} "
+                f"halo_max={max_halo_value} {extra} {stat_label}_min={w_min:.4e} "
+                f"{stat_label}_mean={w_mean:.4e} {stat_label}_max={w_max:.4e}"
+            )
+        )
+
+    out = out_flat.reshape((orig_len,) + feature_shape)
+
+    if post_norm != "none" and feature_shape:
+        channel_dim = int(feature_shape[-1])
+        if channel_dim > 0:
+            out_2d = out.reshape(-1, channel_dim)
+            if post_norm == "layernorm":
+                out_2d = F.layer_norm(out_2d, (channel_dim,), eps=1e-6)
+            elif post_norm == "groupnorm":
+                groups = min(max(1, post_norm_groups), channel_dim)
+                if channel_dim % groups != 0:
+                    groups = math.gcd(channel_dim, groups)
+                    if groups == 0:
+                        groups = 1
+                out_2d = F.group_norm(out_2d.unsqueeze(-1), groups, eps=1e-6).squeeze(-1)
+            out = out_2d.reshape((orig_len,) + feature_shape)
+
+    return out
