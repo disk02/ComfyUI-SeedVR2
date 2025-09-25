@@ -28,7 +28,7 @@ from ...attention import FlashAttentionVarlen
 from ...mm import MMArg, MMModule
 from ...normalization import norm_layer_type
 from ...rope import get_na_rope
-from ...window import get_window_op
+from ...window import get_window_halo_latent, get_window_op
 from itertools import chain
 
 
@@ -185,14 +185,45 @@ class NaSwinAttention(NaMMAttention):
         cache_win = cache.namespace(f"{self.window_method}_{self.window}_sd3")
 
         window_layouts: List[List[Tuple[slice, slice, slice]]] = []
+        window_halo_offsets: List[List[Tuple[int, int, int, int]]] = []
 
         def make_window(x: torch.Tensor):
             t, h, w, _ = x.shape
-            window_slices = self.window_op((t, h, w), self.window)
-            window_layouts.append(window_slices)
-            return [x[st, sh, sw] for (st, sh, sw) in window_slices]
+            base_slices = self.window_op((t, h, w), self.window)
+            halo = max(get_window_halo_latent(), 0)
+
+            expanded_slices: List[Tuple[slice, slice, slice]] = []
+            per_window_offsets: List[Tuple[int, int, int, int]] = []
+
+            for st, sh, sw in base_slices:
+                h_start = 0 if sh.start is None else int(sh.start)
+                h_stop = h if sh.stop is None else int(sh.stop)
+                w_start = 0 if sw.start is None else int(sw.start)
+                w_stop = w if sw.stop is None else int(sw.stop)
+
+                core_h = max(h_stop - h_start, 0)
+                core_w = max(w_stop - w_start, 0)
+
+                halo_h = min(halo, core_h // 2)
+                halo_w = min(halo, core_w // 2)
+
+                top_halo = min(halo_h, h_start)
+                bottom_halo = min(halo_h, h - h_stop)
+                left_halo = min(halo_w, w_start)
+                right_halo = min(halo_w, w - w_stop)
+
+                sh_exp = slice(h_start - top_halo, h_stop + bottom_halo)
+                sw_exp = slice(w_start - left_halo, w_stop + right_halo)
+
+                expanded_slices.append((st, sh_exp, sw_exp))
+                per_window_offsets.append((top_halo, bottom_halo, left_halo, right_halo))
+
+            window_layouts.append(expanded_slices)
+            window_halo_offsets.append(per_window_offsets)
+            return [x[st, sh_exp, sw_exp] for (st, sh_exp, sw_exp) in expanded_slices]
 
         make_window.window_slices = window_layouts
+        make_window.window_halo_offsets = window_halo_offsets
 
         window_partition, window_reverse, window_shape, window_count = cache_win(
             "win_transform",

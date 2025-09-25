@@ -236,23 +236,60 @@ def window_idx(
     tgt_idx = tgt_idx.squeeze(-1)
     src_idx = torch.argsort(tgt_idx)
     window_slices = getattr(window_fn, "window_slices", None)
+    halo_offsets_attr = getattr(window_fn, "window_halo_offsets", None)
+
     if isinstance(window_slices, Sequence):
         flat_slices: List[Tuple[slice, slice, slice]] = []
         sample_indices: List[int] = []
+        flat_halo_offsets: List[Tuple[int, int, int, int]] = []
+        halo_valid = isinstance(halo_offsets_attr, Sequence)
         for sample_idx, per_sample in enumerate(window_slices):
             if not isinstance(per_sample, Sequence):
                 flat_slices = []
                 sample_indices = []
+                flat_halo_offsets = []
+                halo_valid = False
                 break
-            for slc in per_sample:
+            halo_seq = (
+                halo_offsets_attr[sample_idx]
+                if halo_valid and sample_idx < len(halo_offsets_attr)
+                else None
+            )
+            if halo_seq is not None and not isinstance(halo_seq, Sequence):
+                halo_valid = False
+                flat_halo_offsets = []
+                halo_seq = None
+            for window_idx_entry, slc in enumerate(per_sample):
                 flat_slices.append(tuple(slc))
                 sample_indices.append(sample_idx)
+                if halo_valid and halo_seq is not None and window_idx_entry < len(halo_seq):
+                    offsets = halo_seq[window_idx_entry]
+                    if (
+                        isinstance(offsets, Sequence)
+                        and len(offsets) == 4
+                        and all(isinstance(v, (int, float)) for v in offsets)
+                    ):
+                        flat_halo_offsets.append(
+                            (int(offsets[0]), int(offsets[1]), int(offsets[2]), int(offsets[3]))
+                        )
+                    else:
+                        halo_valid = False
+                        flat_halo_offsets = []
+                        halo_seq = None
+                elif halo_valid:
+                    halo_valid = False
+                    flat_halo_offsets = []
+                    halo_seq = None
         if len(flat_slices) != len(tgt_shape):
             flat_slices = []
             sample_indices = []
+            flat_halo_offsets = []
+        if not halo_valid or len(flat_halo_offsets) != len(flat_slices):
+            flat_halo_offsets = []
     else:
         flat_slices = []
         sample_indices = []
+        flat_halo_offsets = []
 
     has_slices = bool(flat_slices)
     if has_slices:
@@ -260,11 +297,13 @@ def window_idx(
         window_shapes = tgt_shape.clone()
         sample_lookup = sample_indices.copy()
         slice_lookup = flat_slices.copy()
+        halo_lookup = flat_halo_offsets.copy() if flat_halo_offsets else None
     else:
         sample_shapes = None
         window_shapes = None
         sample_lookup = None
         slice_lookup = None
+        halo_lookup = None
 
     return (
         lambda hid: torch.index_select(hid, 0, tgt_idx),
@@ -276,6 +315,7 @@ def window_idx(
             sample_shapes,
             slice_lookup,
             sample_lookup,
+            halo_lookup,
         ),
         tgt_shape,
         tgt_windows,
@@ -290,6 +330,7 @@ def _window_reverse(
     sample_shapes: torch.LongTensor | None,
     slice_lookup: List[Tuple[slice, slice, slice]] | None,
     sample_lookup: List[int] | None,
+    halo_lookup: List[Tuple[int, int, int, int]] | None,
 ) -> torch.Tensor:
     policy, margin = get_spatial_blend_settings()
     if (
@@ -299,6 +340,7 @@ def _window_reverse(
         or sample_shapes is None
         or not slice_lookup
         or sample_lookup is None
+        or halo_lookup is None
         or hid.numel() == 0
     ):
         return torch.index_select(hid, 0, src_idx)
@@ -332,6 +374,15 @@ def _window_reverse(
             _slice_bounds(slc_h, win_shape[1], sample_shape[1]),
             _slice_bounds(slc_w, win_shape[2], sample_shape[2]),
         )
+        halo_offsets = halo_lookup[idx]
+        side_margins = (
+            min(margin, max(int(halo_offsets[0]), 0)),
+            min(margin, max(int(halo_offsets[1]), 0)),
+            min(margin, max(int(halo_offsets[2]), 0)),
+            min(margin, max(int(halo_offsets[3]), 0)),
+        )
+        if side_margins == (0, 0, 0, 0):
+            side_margins = None
         mask = make_spatial_blend_mask(
             win_shape,
             sample_shape,
@@ -339,6 +390,7 @@ def _window_reverse(
             margin,
             device=hid.device,
             dtype=hid.dtype,
+            side_margins=side_margins,
         )
         mask_flat = mask.reshape(-1)
         weighted = chunk * mask_flat.unsqueeze(-1)

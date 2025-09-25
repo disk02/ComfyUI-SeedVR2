@@ -20,6 +20,7 @@ import torch
 
 _SPATIAL_BLEND_POLICY: str = "hann"
 _SPATIAL_BLEND_MARGIN: int = 24
+_WINDOW_HALO_LATENT: int = 16
 _HANN_CACHE: Dict[Tuple[int, int, int, int, int, int, torch.dtype, str], torch.Tensor] = {}
 
 
@@ -33,6 +34,15 @@ def set_spatial_blend(policy: str, margin: int) -> None:
 
 def get_spatial_blend_settings() -> Tuple[str, int]:
     return _SPATIAL_BLEND_POLICY, _SPATIAL_BLEND_MARGIN
+
+
+def set_window_halo_latent(halo: int) -> None:
+    global _WINDOW_HALO_LATENT
+    _WINDOW_HALO_LATENT = max(int(halo), 0)
+
+
+def get_window_halo_latent() -> int:
+    return _WINDOW_HALO_LATENT
 
 
 def _hann_edge_weights_1d(
@@ -75,6 +85,7 @@ def make_spatial_blend_mask(
     device: torch.device,
     dtype: torch.dtype,
     min_value: float = 1e-3,
+    side_margins: Tuple[int, int, int, int] | None = None,
 ) -> torch.Tensor:
     wt, wh, ww = map(int, window_shape)
     _, sample_h, sample_w = map(int, sample_shape)
@@ -82,10 +93,26 @@ def make_spatial_blend_mask(
 
     margin = max(int(margin), 0)
 
-    top_margin = min(margin, top)
-    bottom_margin = min(margin, max(sample_h - bottom, 0))
-    left_margin = min(margin, left)
-    right_margin = min(margin, max(sample_w - right, 0))
+    if side_margins is not None:
+        top_override, bottom_override, left_override, right_override = (
+            max(int(side_margins[0]), 0),
+            max(int(side_margins[1]), 0),
+            max(int(side_margins[2]), 0),
+            max(int(side_margins[3]), 0),
+        )
+        top_margin = min(top_override, wh)
+        bottom_margin = min(bottom_override, wh)
+        left_margin = min(left_override, ww)
+        right_margin = min(right_override, ww)
+        base_margin_h = max(top_margin, bottom_margin)
+        base_margin_w = max(left_margin, right_margin)
+    else:
+        top_margin = min(margin, top)
+        bottom_margin = min(margin, max(sample_h - bottom, 0))
+        left_margin = min(margin, left)
+        right_margin = min(margin, max(sample_w - right, 0))
+        base_margin_h = margin
+        base_margin_w = margin
 
     cache_key = (
         wh,
@@ -101,7 +128,7 @@ def make_spatial_blend_mask(
     if mask is None:
         h_weights = _hann_edge_weights_1d(
             wh,
-            margin,
+            base_margin_h,
             top_margin,
             bottom_margin,
             device=device,
@@ -110,7 +137,7 @@ def make_spatial_blend_mask(
         )
         w_weights = _hann_edge_weights_1d(
             ww,
-            margin,
+            base_margin_w,
             left_margin,
             right_margin,
             device=device,

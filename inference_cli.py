@@ -337,6 +337,10 @@ def _validate_inputs(args) -> None:
     if margin < 8 or margin > 48:
         raise SystemExit("[ERROR] --spatial_blend_margin must be between 8 and 48 latent pixels.")
 
+    halo = int(getattr(args, "window_halo_latent", 16))
+    if halo < 0:
+        raise SystemExit("[ERROR] --window_halo_latent must be a non-negative integer (latent pixels).")
+
 
 def _configure_spatial_blend(args) -> None:
     policy = getattr(args, "spatial_blend", "hann")
@@ -362,6 +366,40 @@ def _configure_spatial_blend(args) -> None:
         category="dit",
         force=True,
     )
+
+
+def _configure_window_halo(args) -> None:
+    halo = max(0, int(getattr(args, "window_halo_latent", 16)))
+
+    try:
+        from src.models.dit.window import set_window_halo_latent as set_window_halo_v1
+    except ImportError:
+        set_window_halo_v1 = None
+
+    try:
+        from src.models.dit_v2.window import set_window_halo_latent as set_window_halo_v2
+    except ImportError:
+        set_window_halo_v2 = None
+
+    if set_window_halo_v1 is not None:
+        set_window_halo_v1(halo)
+    if set_window_halo_v2 is not None:
+        set_window_halo_v2(halo)
+
+    debug.log(
+        f"Window halo (latent px per side): {halo}",
+        category="dit",
+        force=True,
+    )
+
+    policy = getattr(args, "spatial_blend", "hann")
+    margin = max(0, int(getattr(args, "spatial_blend_margin", 24)))
+    if policy == "hann" and margin > halo:
+        debug.log(
+            f"[WARN] spatial_blend_margin ({margin}) exceeds window_halo_latent ({halo}); taper clipped to halo.",
+            category="dit",
+            force=True,
+        )
 
 
 def load_image_as_tensor(path: str) -> Tuple[torch.Tensor, bool]:
@@ -1506,6 +1544,12 @@ def parse_arguments():
         default=24,
         help="Spatial blending margin in latent pixels (range: 8-48).",
     )
+    parser.add_argument(
+        "--window_halo_latent",
+        type=int,
+        default=16,
+        help="Spatial halo overlap per side in latent pixels (0 disables overlap).",
+    )
     parser.add_argument("--prepend_frames", type=int, default=0,
                         help="Number of frames to prepend to the video (default: 0). This can help with artifacts at the start of the video and are removed after processing")
     parser.add_argument("--offload_io_components", action="store_true",
@@ -1529,6 +1573,7 @@ def main():
     args = parse_arguments()
     debug.enabled = args.debug
     _configure_spatial_blend(args)
+    _configure_window_halo(args)
 
     using_image_mode = bool(
         getattr(args, "image_path", None)
