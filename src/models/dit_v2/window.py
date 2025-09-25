@@ -13,8 +13,119 @@
 # // limitations under the License.
 
 from math import ceil
-from typing import Tuple
+from typing import Dict, Tuple
 import math
+
+import torch
+
+_SPATIAL_BLEND_POLICY: str = "hann"
+_SPATIAL_BLEND_MARGIN: int = 24
+_HANN_CACHE: Dict[Tuple[int, int, int, int, int, int, torch.dtype, str], torch.Tensor] = {}
+
+
+def set_spatial_blend(policy: str, margin: int) -> None:
+    global _SPATIAL_BLEND_POLICY, _SPATIAL_BLEND_MARGIN
+    if policy not in {"off", "hann"}:
+        raise ValueError(f"Unsupported spatial blend policy: {policy}")
+    _SPATIAL_BLEND_POLICY = policy
+    _SPATIAL_BLEND_MARGIN = max(int(margin), 0)
+
+
+def get_spatial_blend_settings() -> Tuple[str, int]:
+    return _SPATIAL_BLEND_POLICY, _SPATIAL_BLEND_MARGIN
+
+
+def _hann_edge_weights_1d(
+    length: int,
+    base_margin: int,
+    left_margin: int,
+    right_margin: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    min_value: float = 1e-3,
+) -> torch.Tensor:
+    if length <= 0:
+        return torch.ones(0, device=device, dtype=dtype)
+
+    weights = torch.ones(length, device=device, dtype=dtype)
+    if base_margin <= 0:
+        return weights
+
+    left = min(max(int(left_margin), 0), length)
+    right = min(max(int(right_margin), 0), length)
+
+    if left > 0:
+        ramp = torch.linspace(0.0, math.pi, left, device=device, dtype=torch.float32)
+        ramp = min_value + (1.0 - min_value) * 0.5 * (1.0 - torch.cos(ramp))
+        weights[:left] = ramp.to(dtype=dtype)
+    if right > 0:
+        ramp = torch.linspace(0.0, math.pi, right, device=device, dtype=torch.float32)
+        ramp = min_value + (1.0 - min_value) * 0.5 * (1.0 - torch.cos(ramp))
+        weights[-right:] = torch.flip(ramp.to(dtype=dtype), dims=[0])
+    return weights
+
+
+def make_spatial_blend_mask(
+    window_shape: Tuple[int, int, int],
+    sample_shape: Tuple[int, int, int],
+    window_slice: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]],
+    margin: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    min_value: float = 1e-3,
+) -> torch.Tensor:
+    wt, wh, ww = map(int, window_shape)
+    _, sample_h, sample_w = map(int, sample_shape)
+    (_, _), (top, bottom), (left, right) = window_slice
+
+    margin = max(int(margin), 0)
+
+    top_margin = min(margin, top)
+    bottom_margin = min(margin, max(sample_h - bottom, 0))
+    left_margin = min(margin, left)
+    right_margin = min(margin, max(sample_w - right, 0))
+
+    cache_key = (
+        wh,
+        ww,
+        top_margin,
+        bottom_margin,
+        left_margin,
+        right_margin,
+        dtype,
+        str(device),
+    )
+    mask = _HANN_CACHE.get(cache_key)
+    if mask is None:
+        h_weights = _hann_edge_weights_1d(
+            wh,
+            margin,
+            top_margin,
+            bottom_margin,
+            device=device,
+            dtype=dtype,
+            min_value=min_value,
+        )
+        w_weights = _hann_edge_weights_1d(
+            ww,
+            margin,
+            left_margin,
+            right_margin,
+            device=device,
+            dtype=dtype,
+            min_value=min_value,
+        )
+        mask_2d = torch.outer(h_weights, w_weights)
+        if wt > 1:
+            mask = mask_2d.unsqueeze(0).expand(wt, -1, -1)
+        else:
+            mask = mask_2d.unsqueeze(0)
+        _HANN_CACHE[cache_key] = mask
+    if mask.device != device or mask.dtype != dtype:
+        mask = mask.to(device=device, dtype=dtype)
+    return mask
 
 def get_window_op(name: str):
     if name == "720pwin_by_size_bysize":

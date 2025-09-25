@@ -333,6 +333,36 @@ def _validate_inputs(args) -> None:
                     "[ERROR] Batch image mode requires a directory for --output; use --out_dir or supply a directory path."
                 )
 
+    margin = int(getattr(args, "spatial_blend_margin", 24))
+    if margin < 8 or margin > 48:
+        raise SystemExit("[ERROR] --spatial_blend_margin must be between 8 and 48 latent pixels.")
+
+
+def _configure_spatial_blend(args) -> None:
+    policy = getattr(args, "spatial_blend", "hann")
+    margin = max(0, int(getattr(args, "spatial_blend_margin", 24)))
+
+    try:
+        from src.models.dit.window import set_spatial_blend as set_spatial_blend_v1
+    except ImportError:
+        set_spatial_blend_v1 = None
+
+    try:
+        from src.models.dit_v2.window import set_spatial_blend as set_spatial_blend_v2
+    except ImportError:
+        set_spatial_blend_v2 = None
+
+    if set_spatial_blend_v1 is not None:
+        set_spatial_blend_v1(policy, margin)
+    if set_spatial_blend_v2 is not None:
+        set_spatial_blend_v2(policy, margin)
+
+    debug.log(
+        f"Spatial blend policy: {policy} (margin={margin})",
+        category="dit",
+        force=True,
+    )
+
 
 def load_image_as_tensor(path: str) -> Tuple[torch.Tensor, bool]:
     """Load an image as float16 RGB tensor [1, H, W, 3]; return flag if alpha was dropped."""
@@ -1464,6 +1494,18 @@ def parse_arguments():
                         help="Use non-blocking memory transfers for VRAM optimization")
     parser.add_argument("--temporal_overlap", type=int, default=0,
                         help="Temporal overlap for processing (default: 0, no temporal overlap)")
+    parser.add_argument(
+        "--spatial_blend",
+        choices=["off", "hann"],
+        default="hann",
+        help="Spatial blending policy for window stitching (default: hann).",
+    )
+    parser.add_argument(
+        "--spatial_blend_margin",
+        type=int,
+        default=24,
+        help="Spatial blending margin in latent pixels (range: 8-48).",
+    )
     parser.add_argument("--prepend_frames", type=int, default=0,
                         help="Number of frames to prepend to the video (default: 0). This can help with artifacts at the start of the video and are removed after processing")
     parser.add_argument("--offload_io_components", action="store_true",
@@ -1486,6 +1528,7 @@ def main():
     # Parse arguments
     args = parse_arguments()
     debug.enabled = args.debug
+    _configure_spatial_blend(args)
 
     using_image_mode = bool(
         getattr(args, "image_path", None)

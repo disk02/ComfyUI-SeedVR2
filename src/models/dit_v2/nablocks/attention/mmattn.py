@@ -12,7 +12,7 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 from torch import nn
@@ -184,10 +184,15 @@ class NaSwinAttention(NaMMAttention):
         # re-org the input seq for window attn
         cache_win = cache.namespace(f"{self.window_method}_{self.window}_sd3")
 
+        window_layouts: List[List[Tuple[slice, slice, slice]]] = []
+
         def make_window(x: torch.Tensor):
             t, h, w, _ = x.shape
             window_slices = self.window_op((t, h, w), self.window)
+            window_layouts.append(window_slices)
             return [x[st, sh, sw] for (st, sh, sw) in window_slices]
+
+        make_window.window_slices = window_layouts
 
         window_partition, window_reverse, window_shape, window_count = cache_win(
             "win_transform",

@@ -13,9 +13,11 @@
 # // limitations under the License.
 
 from itertools import chain
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 import einops
 import torch
+
+from .window import get_spatial_blend_settings, make_spatial_blend_mask
 
 
 def flatten(
@@ -233,9 +235,115 @@ def window_idx(
     tgt_idx, tgt_shape, tgt_windows = window(hid_idx, hid_shape, window_fn)
     tgt_idx = tgt_idx.squeeze(-1)
     src_idx = torch.argsort(tgt_idx)
+    window_slices = getattr(window_fn, "window_slices", None)
+    if isinstance(window_slices, Sequence):
+        flat_slices: List[Tuple[slice, slice, slice]] = []
+        sample_indices: List[int] = []
+        for sample_idx, per_sample in enumerate(window_slices):
+            if not isinstance(per_sample, Sequence):
+                flat_slices = []
+                sample_indices = []
+                break
+            for slc in per_sample:
+                flat_slices.append(tuple(slc))
+                sample_indices.append(sample_idx)
+        if len(flat_slices) != len(tgt_shape):
+            flat_slices = []
+            sample_indices = []
+    else:
+        flat_slices = []
+        sample_indices = []
+
+    has_slices = bool(flat_slices)
+    if has_slices:
+        sample_shapes = hid_shape.clone()
+        window_shapes = tgt_shape.clone()
+        sample_lookup = sample_indices.copy()
+        slice_lookup = flat_slices.copy()
+    else:
+        sample_shapes = None
+        window_shapes = None
+        sample_lookup = None
+        slice_lookup = None
+
     return (
         lambda hid: torch.index_select(hid, 0, tgt_idx),
-        lambda hid: torch.index_select(hid, 0, src_idx),
+        lambda hid: _window_reverse(
+            hid,
+            src_idx,
+            tgt_idx,
+            window_shapes,
+            sample_shapes,
+            slice_lookup,
+            sample_lookup,
+        ),
         tgt_shape,
         tgt_windows,
     )
+
+
+def _window_reverse(
+    hid: torch.Tensor,
+    src_idx: torch.LongTensor,
+    tgt_idx: torch.LongTensor,
+    window_shapes: torch.LongTensor | None,
+    sample_shapes: torch.LongTensor | None,
+    slice_lookup: List[Tuple[slice, slice, slice]] | None,
+    sample_lookup: List[int] | None,
+) -> torch.Tensor:
+    policy, margin = get_spatial_blend_settings()
+    if (
+        policy != "hann"
+        or margin <= 0
+        or window_shapes is None
+        or sample_shapes is None
+        or not slice_lookup
+        or sample_lookup is None
+        or hid.numel() == 0
+    ):
+        return torch.index_select(hid, 0, src_idx)
+
+    feature_shape = hid.shape[1:]
+    hid_flat = hid.reshape(hid.shape[0], -1)
+    orig_len = sample_shapes.prod(-1).sum().item()
+
+    out_flat = hid_flat.new_zeros((orig_len, hid_flat.shape[1]))
+    weight_flat = hid_flat.new_zeros(orig_len)
+
+    window_sizes = window_shapes.prod(-1).tolist()
+    chunks = hid_flat.split(window_sizes, dim=0)
+    idx_chunks = tgt_idx.split(window_sizes)
+
+    def _slice_bounds(s: slice, length: int, total: int) -> Tuple[int, int]:
+        start = 0 if s.start is None else int(s.start)
+        if s.stop is None:
+            stop = min(start + length, total)
+        else:
+            stop = int(s.stop)
+        return start, stop
+
+    for idx, (chunk, idx_vec) in enumerate(zip(chunks, idx_chunks)):
+        sample_idx = sample_lookup[idx]
+        sample_shape = tuple(int(v) for v in sample_shapes[sample_idx].tolist())
+        win_shape = tuple(int(v) for v in window_shapes[idx].tolist())
+        slc_t, slc_h, slc_w = slice_lookup[idx]
+        norm_slice = (
+            _slice_bounds(slc_t, win_shape[0], sample_shape[0]),
+            _slice_bounds(slc_h, win_shape[1], sample_shape[1]),
+            _slice_bounds(slc_w, win_shape[2], sample_shape[2]),
+        )
+        mask = make_spatial_blend_mask(
+            win_shape,
+            sample_shape,
+            norm_slice,
+            margin,
+            device=hid.device,
+            dtype=hid.dtype,
+        )
+        mask_flat = mask.reshape(-1)
+        weighted = chunk * mask_flat.unsqueeze(-1)
+        out_flat.index_add_(0, idx_vec, weighted)
+        weight_flat.index_add_(0, idx_vec, mask_flat)
+
+    out_flat = out_flat / torch.clamp(weight_flat.unsqueeze(-1), min=1e-6)
+    return out_flat.reshape((orig_len,) + feature_shape)
