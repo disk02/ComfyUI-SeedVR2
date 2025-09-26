@@ -12,12 +12,25 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
+import math
 from typing import Union
+
 import torch
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
+
 from src.common.distributed import has_mps
+
+
+def _round_up_to_multiple(value: int, base: int) -> int:
+    """Round ``value`` up to the nearest positive multiple of ``base``."""
+
+    if base <= 0:
+        raise ValueError("base must be a positive integer")
+    if value <= 0:
+        return base
+    return int(math.ceil(value / base) * base)
 
 class SideResize:
     def __init__(
@@ -53,4 +66,16 @@ class SideResize:
         else:
             size = self.size
 
-        return TVF.resize(image, size, self.interpolation)
+        short_side = min(width, height)
+        if short_side <= 0:
+            raise ValueError("Image must have positive dimensions")
+
+        scale = size / short_side if short_side else 1.0
+        target_height = max(1, int(round(height * scale)))
+        target_width = max(1, int(round(width * scale)))
+
+        # Round up to the nearest multiple of 16 to stay aligned with VAE stride.
+        target_height = _round_up_to_multiple(target_height, 16)
+        target_width = _round_up_to_multiple(target_width, 16)
+
+        return TVF.resize(image, [target_height, target_width], self.interpolation)

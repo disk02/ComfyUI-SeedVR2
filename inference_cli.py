@@ -1531,9 +1531,10 @@ def parse_arguments():
     parser.add_argument("--model", type=str, default="seedvr2_ema_3b_fp8_e4m3fn.safetensors",
                         choices=[
                             "seedvr2_ema_3b_fp16.safetensors",
-                            "seedvr2_ema_3b_fp8_e4m3fn.safetensors", 
+                            "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
                             "seedvr2_ema_7b_fp16.safetensors",
-                            "seedvr2_ema_7b_fp8_e4m3fn.safetensors"
+                            "seedvr2_ema_7b_fp8_e4m3fn.safetensors",
+                            "seedvr2_ema_7b_sharp_fp8_e4m3fn.safetensors"
                         ],
                         help="Model to use (default: 3B FP8)")
     parser.add_argument("--model_dir", type=str, default="seedvr2_models",
