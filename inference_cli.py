@@ -444,6 +444,120 @@ def _configure_window_halo(args) -> None:
         )
 
 
+def _round_to_multiple(x: int, mult: int) -> int:
+    if mult <= 1:
+        return max(1, int(x))
+    rounded = int(round(float(x) / float(mult)) * mult)
+    if rounded < mult:
+        rounded = mult
+    return max(1, rounded)
+
+
+def _make_aspect_guard_config(args, input_aspect: Optional[float]) -> Optional[Dict[str, Any]]:
+    if not getattr(args, "enforce_aspect", False):
+        return None
+    if input_aspect is None or not math.isfinite(input_aspect) or input_aspect <= 0.0:
+        return None
+    tol = float(getattr(args, "aspect_tol", 0.002))
+    if tol < 0.0:
+        tol = 0.0
+    mult = max(1, int(getattr(args, "aspect_round_multiple", 16)))
+    return {
+        "input_aspect": float(input_aspect),
+        "tol": tol,
+        "mult": mult,
+        "logged": False,
+    }
+
+
+def _enforce_aspect_guard_np(frame_hwc: np.ndarray, guard: Dict[str, Any]) -> Tuple[np.ndarray, bool]:
+    if frame_hwc.ndim != 3 or frame_hwc.shape[0] <= 0 or frame_hwc.shape[1] <= 0:
+        return frame_hwc, False
+
+    input_aspect = guard["input_aspect"]
+    tol = guard["tol"]
+    mult = guard["mult"]
+
+    height, width = int(frame_hwc.shape[0]), int(frame_hwc.shape[1])
+    out_aspect = width / float(height)
+    if abs(out_aspect - input_aspect) <= tol:
+        return frame_hwc, False
+
+    target_w_raw = max(1, int(round(input_aspect * height)))
+    target_h_raw = max(1, int(round(width / input_aspect)))
+
+    cand_w = max(2, _round_to_multiple(target_w_raw, mult))
+    cand_h = max(2, _round_to_multiple(target_h_raw, mult))
+
+    diff_w = abs(cand_w - width)
+    diff_h = abs(cand_h - height)
+
+    change_width = diff_w != 0 and (diff_h == 0 or diff_w <= diff_h)
+    change_height = diff_h != 0 and not change_width
+
+    target_w = width
+    target_h = height
+
+    if change_width:
+        target_w = cand_w
+    elif change_height:
+        target_h = cand_h
+    else:
+        # No rounded candidate changed dimensions; nothing to do.
+        return frame_hwc, False
+
+    target_w = max(2, int(target_w))
+    target_h = max(2, int(target_h))
+
+    if target_w == width and target_h == height:
+        return frame_hwc, False
+
+    if frame_hwc.dtype == np.uint8:
+        base_uint8 = frame_hwc
+    else:
+        base_uint8 = np.clip(frame_hwc, 0.0, 1.0)
+        base_uint8 = np.rint(base_uint8 * 255.0).astype(np.uint8)
+
+    img = Image.fromarray(base_uint8, mode="RGB")
+    img = img.resize((int(target_w), int(target_h)), resample=Image.BICUBIC)
+    resized_uint8 = np.asarray(img, dtype=np.uint8)
+
+    if frame_hwc.dtype == np.uint8:
+        result = resized_uint8
+    else:
+        result = resized_uint8.astype(np.float32) / 255.0
+
+    if not guard.get("logged", False):
+        delta_w = int(target_w - width) if target_w != width else 0
+        delta_h = int(target_h - height) if target_h != height else 0
+        print(
+            f"[AspectGuard] corrected {width}x{height} → {target_w}x{target_h} "
+            f"(ΔW={delta_w}, ΔH={delta_h}, tol={tol}, mult={mult})"
+        )
+        guard["logged"] = True
+
+    return result, True
+
+
+def _apply_aspect_guard_np(frames: np.ndarray, guard: Optional[Dict[str, Any]]) -> np.ndarray:
+    if not guard:
+        return frames
+    if frames.ndim == 3:
+        corrected, _ = _enforce_aspect_guard_np(frames, guard)
+        return corrected
+    if frames.ndim == 4:
+        corrected_frames = []
+        changed = False
+        for frame in frames:
+            corrected_frame, frame_changed = _enforce_aspect_guard_np(frame, guard)
+            corrected_frames.append(corrected_frame)
+            changed = changed or frame_changed
+        if not changed:
+            return frames
+        return np.stack(corrected_frames, axis=0)
+    return frames
+
+
 def load_image_as_tensor(path: str) -> Tuple[torch.Tensor, bool]:
     """Load an image as float16 RGB tensor [1, H, W, 3]; return flag if alpha was dropped."""
 
@@ -539,6 +653,9 @@ def _run_single_image(args, image_path: str) -> None:
     if in_h < 1 or in_w < 1:
         raise SystemExit("[ERROR] Invalid input image size.")
 
+    input_aspect = in_w / float(in_h) if in_h > 0 else None
+    aspect_guard = _make_aspect_guard_config(args, input_aspect)
+
     print(f"[INFO] Interpolation: resizing short side to {args.resolution} (preserving aspect ratio).")
     approx_ram = _approx_image_ram_bytes(in_h, in_w)
     print(
@@ -573,7 +690,13 @@ def _run_single_image(args, image_path: str) -> None:
     imageio_kwargs = _imageio_kwargs_for_path(out_path, args)
 
     try:
-        write_single_image(None, result_tensor, out_path, imageio_kwargs=imageio_kwargs)
+        write_single_image(
+            None,
+            result_tensor,
+            out_path,
+            imageio_kwargs=imageio_kwargs,
+            aspect_guard=aspect_guard,
+        )
     except PermissionError:
         raise SystemExit(f"[ERROR] Permission denied writing: {out_path}")
     except Exception as exc:
@@ -659,6 +782,9 @@ def _run_batch_images(args) -> None:
             print(f"[WARN] Failed: {path} :: Invalid input image size")
             continue
 
+        input_aspect = w / float(h) if h > 0 else None
+        aspect_guard = _make_aspect_guard_config(args, input_aspect)
+
         print(f"[INFO] ({idx}/{total}) Interpolation: resizing short side to {args.resolution} (preserving aspect ratio).")
         approx_ram = _approx_image_ram_bytes(h, w)
         print(
@@ -684,7 +810,13 @@ def _run_batch_images(args) -> None:
         imageio_kwargs = _imageio_kwargs_for_path(out_path, args)
 
         try:
-            write_single_image(None, result_tensor, out_path, imageio_kwargs=imageio_kwargs)
+            write_single_image(
+                None,
+                result_tensor,
+                out_path,
+                imageio_kwargs=imageio_kwargs,
+                aspect_guard=aspect_guard,
+            )
         except PermissionError:
             errors.append((path, "Permission denied writing output"))
             print(f"[WARN] Failed: {path} :: Permission denied writing output")
@@ -734,6 +866,7 @@ def write_single_image(
     out_path: str,
     *,
     imageio_kwargs: Optional[Dict[str, Any]] = None,
+    aspect_guard: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Write a single RGB image from fp16 tensors in [0, 1]."""
 
@@ -747,6 +880,11 @@ def write_single_image(
 
     x = x[0]
     x = torch.clamp(x, 0.0, 1.0).mul(255.0).to(torch.uint8).cpu().numpy()
+    if aspect_guard:
+        x = _apply_aspect_guard_np(x, aspect_guard)
+        if x.dtype != np.uint8:
+            x = np.clip(x, 0.0, 1.0)
+            x = np.rint(x * 255.0).astype(np.uint8)
     kwargs = imageio_kwargs or {}
     iio.imwrite(out_path, x, **kwargs)
 
@@ -1098,7 +1236,7 @@ def extract_frames_from_video(video_path, skip_first_frames=0, load_cap=None, pr
     return frames_tensor, fps
 
 
-def save_frames_to_video(frames_tensor, output_path, fps=30.0):
+def save_frames_to_video(frames_tensor, output_path, fps=30.0, *, aspect_guard: Optional[Dict[str, Any]] = None):
     """
     Save frames tensor to video file
     
@@ -1115,7 +1253,10 @@ def save_frames_to_video(frames_tensor, output_path, fps=30.0):
     # Convert tensor to numpy and denormalize
     frames_np = frames_tensor.cpu().numpy()
     frames_np = (frames_np * 255.0).astype(np.uint8)
-    
+    frames_np = _apply_aspect_guard_np(frames_np, aspect_guard)
+    if frames_np.dtype != np.uint8:
+        frames_np = np.clip(frames_np, 0.0, 255.0).astype(np.uint8)
+
     # Get video properties
     T, H, W, C = frames_np.shape
     
@@ -1140,7 +1281,13 @@ def save_frames_to_video(frames_tensor, output_path, fps=30.0):
     debug.log(f"Video saved successfully: {output_path}", category="success")
 
 
-def save_frames_to_png(frames_tensor, output_dir, base_name):
+def save_frames_to_png(
+    frames_tensor,
+    output_dir,
+    base_name,
+    *,
+    aspect_guard: Optional[Dict[str, Any]] = None,
+):
     """
     Save frames tensor as sequential PNG images.
 
@@ -1156,6 +1303,9 @@ def save_frames_to_png(frames_tensor, output_dir, base_name):
 
     # Convert to numpy uint8 RGB
     frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
+    frames_np = _apply_aspect_guard_np(frames_np, aspect_guard)
+    if frames_np.dtype != np.uint8:
+        frames_np = np.clip(frames_np, 0.0, 255.0).astype(np.uint8)
     total = frames_np.shape[0]
     digits = max(5, len(str(total)))  # at least 5 digits
 
@@ -1623,6 +1773,23 @@ def parse_arguments():
         default=16,
         help="Group count for post-stitch group normalization (if enabled).",
     )
+    parser.add_argument(
+        "--enforce_aspect",
+        action="store_true",
+        help="Ensure final output aspect matches input by minimally adjusting one dimension.",
+    )
+    parser.add_argument(
+        "--aspect_tol",
+        type=float,
+        default=0.002,
+        help="Relative tolerance for aspect ratio drift before correction (default 0.002 ≈ 0.2%).",
+    )
+    parser.add_argument(
+        "--aspect_round_multiple",
+        type=int,
+        default=16,
+        help="Round corrected dimension to nearest multiple (use 1 to disable).",
+    )
     parser.add_argument("--prepend_frames", type=int, default=0,
                         help="Number of frames to prepend to the video (default: 0). This can help with artifacts at the start of the video and are removed after processing")
     parser.add_argument("--offload_io_components", action="store_true",
@@ -1774,6 +1941,10 @@ def main():
                 load_cap=load_cap,
                 prepend_frames=0,
             )
+            aspect_guard = _make_aspect_guard_config(
+                args,
+                frames_tensor.shape[3] / float(frames_tensor.shape[2]) if frames_tensor.shape[2] > 0 else None,
+            )
             total_decoded = int(frames_tensor.shape[0])
             model_input = frames_tensor.to(torch.float16)
             applied_prepend = 0
@@ -1813,11 +1984,21 @@ def main():
                 if preferred_fps is None:
                     preferred_fps = 30.0
                 writer_fps = float(preferred_fps)
-                save_frames_to_video(result_tensor, args.output, fps=writer_fps)
+                save_frames_to_video(
+                    result_tensor,
+                    args.output,
+                    fps=writer_fps,
+                    aspect_guard=aspect_guard,
+                )
                 print(f"[SUMMARY] decoded={total_decoded} written={total_written} (fps={writer_fps})")
             else:
                 base_name = Path(args.video_path).stem or "frame"
-                save_frames_to_png(result_tensor, args.output, base_name)
+                save_frames_to_png(
+                    result_tensor,
+                    args.output,
+                    base_name,
+                    aspect_guard=aspect_guard,
+                )
                 print(f"[SUMMARY] decoded={total_decoded} written={total_written} (png)")
         else:
             chunk_size = int(args.load_cap) if args.load_cap and args.load_cap > 0 else 1000
@@ -1844,6 +2025,7 @@ def main():
             chunk_index = 0
             applied_prepend = 0
             chunks_seen = 0
+            aspect_guard = None
 
             runner = get_or_create_runner(args, debug)
 
@@ -1855,6 +2037,12 @@ def main():
                     raw_count = int(chunk["raw_count"])
                     is_last = bool(chunk["is_last"])
                     total_decoded += raw_count
+
+                    if aspect_guard is None:
+                        aspect_guard = _make_aspect_guard_config(
+                            args,
+                            raw_tensor.shape[2] / float(raw_tensor.shape[1]) if raw_tensor.shape[1] > 0 else None,
+                        )
 
                     overlap = max(int(getattr(args, "temporal_overlap", 0) or 0), 0)
                     if raw_count < overlap:
@@ -1910,13 +2098,18 @@ def main():
                         continue
 
                     frames_uint8 = tensor_to_write.clamp(0, 1).mul(255.0).to(torch.uint8).cpu().numpy()
+                    frames_uint8 = _apply_aspect_guard_np(frames_uint8, aspect_guard)
+                    if frames_uint8.dtype != np.uint8:
+                        frames_uint8 = np.clip(frames_uint8, 0.0, 255.0).astype(np.uint8)
+                    frame_height = frames_uint8.shape[1]
+                    frame_width = frames_uint8.shape[2]
 
                     if args.output_format == "video":
                         if writer is None:
                             writer, _, writer_fps = open_video_writer(
                                 meta,
                                 args.output,
-                                (tensor_to_write.shape[1], tensor_to_write.shape[2]),
+                                (frame_height, frame_width),
                                 fps_override=getattr(args, "fps", None),
                             )
                         write_video_frames(writer, frames_uint8)
