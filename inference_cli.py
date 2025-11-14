@@ -360,6 +360,21 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         Number of frames processed from the input
     """
     input_type = get_input_type(input_path)
+
+    if (
+        input_type == "video"
+        and args.chunk_size_frames > 0
+        and args.output_format in (None, "mp4")
+        and len(device_list) == 1
+    ):
+        # Special chunked path (streaming) for long videos on single GPU
+        return _process_video_in_chunks(
+            input_path=input_path,
+            args=args,
+            device_id=device_list[0],
+            output_path=output_path,
+            format_auto_detected=format_auto_detected,
+        )
     
     if input_type == "unknown":
         debug.log(f"Skipping unsupported file: {input_path}", level="WARNING", category="file", force=True)
@@ -438,6 +453,150 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         debug.log(f"Output saved to: {output_path}", category="file", force=True)
     
     return input_frame_count
+
+
+def _process_video_in_chunks(
+    input_path: str,
+    args: argparse.Namespace,
+    device_id: str,
+    output_path: Optional[str],
+    format_auto_detected: bool,
+) -> int:
+    """Process a video input in temporal chunks for single-GPU execution."""
+
+    debug.log(
+        f"Processing video in chunks: {Path(input_path).name}",
+        category="generation",
+        force=True,
+    )
+
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Video file not found: {input_path}")
+
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video file: {input_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    debug.log(
+        f"Video info: {frame_count} frames, {width}x{height}, {fps:.2f} FPS",
+        category="info",
+    )
+
+    skip_first = max(args.skip_first_frames, 0)
+    if skip_first > 0:
+        debug.log(f"Skipping first {skip_first} frames", category="info")
+        skipped = 0
+        while skipped < skip_first:
+            ret, _ = cap.read()
+            if not ret:
+                debug.log(
+                    f"Reached end of video while skipping at frame {skipped}",
+                    category="warning",
+                )
+                break
+            skipped += 1
+        debug.log(f"Skipped {skipped} frames", category="info")
+
+    frames_remaining_cap = args.load_cap if args.load_cap and args.load_cap > 0 else None
+    if frames_remaining_cap is not None:
+        debug.log(f"Processing will stop after {frames_remaining_cap} frames", category="info")
+
+    total_frames_processed = 0
+
+    final_output_path = output_path
+    if final_output_path is None:
+        if format_auto_detected:
+            args.output_format = "mp4"
+        final_output_path = generate_output_path(input_path, "mp4", input_type="video")
+    else:
+        suffix = Path(final_output_path).suffix
+        if not suffix:
+            final_output_path = generate_output_path(
+                input_path,
+                "mp4",
+                output_dir=final_output_path,
+                input_type="video",
+            )
+
+    os.makedirs(Path(final_output_path).parent, exist_ok=True)
+
+    chunk_size = max(args.chunk_size_frames, 1)
+    writer = None
+
+    try:
+        while True:
+            frames = []
+
+            while len(frames) < chunk_size:
+                if frames_remaining_cap is not None and frames_remaining_cap <= 0:
+                    break
+
+                ret, frame_bgr = cap.read()
+                if not ret:
+                    break
+
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                frame_rgb = frame_rgb.astype(np.float32) / 255.0
+                frames.append(frame_rgb)
+
+                total_frames_processed += 1
+                if frames_remaining_cap is not None:
+                    frames_remaining_cap -= 1
+
+            if not frames:
+                break
+
+            frames_np = np.stack(frames, axis=0)
+            frames_tensor = torch.from_numpy(frames_np).to(torch.float32)
+
+            result_chunk = _single_gpu_direct_processing(
+                frames_tensor=frames_tensor,
+                args=args,
+                device_id=device_id,
+                runner_cache={},
+            )
+
+            if hasattr(result_chunk, "detach"):
+                result_chunk = result_chunk.detach()
+            if getattr(result_chunk, "is_cuda", False) or (
+                hasattr(result_chunk, "is_mps") and result_chunk.is_mps
+            ):
+                result_chunk = result_chunk.cpu()
+            if result_chunk.dtype != torch.float32:
+                result_chunk = result_chunk.to(torch.float32)
+            result_chunk = result_chunk.contiguous()
+
+            result_np = (result_chunk.numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            T, H, W, C = result_np.shape
+
+            if writer is None:
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(final_output_path, fourcc, fps, (W, H))
+                if not writer.isOpened():
+                    raise ValueError(f"Cannot create video writer for: {final_output_path}")
+
+            for i in range(T):
+                frame_rgb = result_np[i]
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                writer.write(frame_bgr)
+
+            debug.log(
+                f"Chunk written: {T} frames (total processed: {total_frames_processed})",
+                category="file",
+            )
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+
+    debug.log(f"Output saved to: {final_output_path}", category="file", force=True)
+
+    return total_frames_processed
 
 
 def extract_frames_from_video(
@@ -1098,6 +1257,10 @@ Examples:
                         help="Skip N initial frames (default: 0)")
     process_group.add_argument("--load_cap", type=int, default=0,
                         help="Load maximum N frames from video. 0 = load all (default: 0)")
+    process_group.add_argument(
+        "--chunk_size_frames", type=int, default=0,
+        help="Process video in temporal chunks of N frames to reduce RAM usage. 0 = process all frames at once (default)."
+    )
     process_group.add_argument("--prepend_frames", type=int, default=0,
                         help="Prepend N reversed frames to reduce start artifacts (auto-removed). Default: 0")
     process_group.add_argument("--temporal_overlap", type=int, default=0,
