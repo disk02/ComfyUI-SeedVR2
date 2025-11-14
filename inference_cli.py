@@ -374,6 +374,7 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
             device_id=device_list[0],
             output_path=output_path,
             format_auto_detected=format_auto_detected,
+            runner_cache=runner_cache,
         )
     
     if input_type == "unknown":
@@ -461,6 +462,7 @@ def _process_video_in_chunks(
     device_id: str,
     output_path: Optional[str],
     format_auto_detected: bool,
+    runner_cache: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Process a video input in temporal chunks for single-GPU execution."""
 
@@ -472,6 +474,8 @@ def _process_video_in_chunks(
 
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Video file not found: {input_path}")
+
+    cache = runner_cache if runner_cache is not None else {}
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -507,6 +511,14 @@ def _process_video_in_chunks(
         debug.log(f"Processing will stop after {frames_remaining_cap} frames", category="info")
 
     total_frames_processed = 0
+
+    temporal_overlap = max(int(getattr(args, "temporal_overlap", 0) or 0), 0)
+    use_temporal_overlap = temporal_overlap > 0
+
+    prev_input_tail: Optional[torch.Tensor] = None
+    prev_output_tail: Optional[torch.Tensor] = None
+
+    chunk_index = 0
 
     final_output_path = output_path
     if final_output_path is None:
@@ -553,12 +565,22 @@ def _process_video_in_chunks(
 
             frames_np = np.stack(frames, axis=0)
             frames_tensor = torch.from_numpy(frames_np).to(torch.float32)
+            chunk_len = frames_tensor.shape[0]
+
+            prepend_len = 0
+            if use_temporal_overlap and prev_input_tail is not None:
+                prepend_len = min(temporal_overlap, prev_input_tail.shape[0])
+
+            if prepend_len > 0:
+                input_ctx = torch.cat([prev_input_tail[-prepend_len:], frames_tensor], dim=0)
+            else:
+                input_ctx = frames_tensor
 
             result_chunk = _single_gpu_direct_processing(
-                frames_tensor=frames_tensor,
+                frames_tensor=input_ctx,
                 args=args,
                 device_id=device_id,
-                runner_cache={},
+                runner_cache=cache,
             )
 
             if hasattr(result_chunk, "detach"):
@@ -571,27 +593,94 @@ def _process_video_in_chunks(
                 result_chunk = result_chunk.to(torch.float32)
             result_chunk = result_chunk.contiguous()
 
-            result_np = (result_chunk.numpy() * 255.0).clip(0, 255).astype(np.uint8)
-            T, H, W, C = result_np.shape
+            if not use_temporal_overlap or prepend_len == 0:
+                if use_temporal_overlap and result_chunk.shape[0] > temporal_overlap:
+                    frames_to_write = result_chunk[:-temporal_overlap]
+                    new_tail = result_chunk[-temporal_overlap:]
+                else:
+                    frames_to_write = result_chunk
+                    new_tail = None
+            else:
+                overlap_out = result_chunk[:prepend_len]
+                new_out = result_chunk[prepend_len:]
 
-            if writer is None:
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(final_output_path, fourcc, fps, (W, H))
-                if not writer.isOpened():
-                    raise ValueError(f"Cannot create video writer for: {final_output_path}")
+                frames_to_write = new_out
+                new_tail = None
 
-            for i in range(T):
-                frame_rgb = result_np[i]
-                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                writer.write(frame_bgr)
+                if prev_output_tail is not None:
+                    overlap = min(
+                        temporal_overlap,
+                        prev_output_tail.shape[0],
+                        overlap_out.shape[0],
+                    )
+                    if overlap > 0:
+                        prev_tail = prev_output_tail[-overlap:]
+                        cur_head = overlap_out[:overlap]
+                        blended_overlap = blend_overlapping_frames(prev_tail, cur_head, overlap)
 
-            debug.log(
-                f"Chunk written: {T} frames (total processed: {total_frames_processed})",
-                category="file",
-            )
+                        if new_out.shape[0] > temporal_overlap:
+                            body = new_out[:-temporal_overlap]
+                            new_tail = new_out[-temporal_overlap:]
+                        else:
+                            body = new_out
+                            new_tail = None
+
+                        frames_to_write = torch.cat([blended_overlap, body], dim=0)
+                    else:
+                        frames_to_write = new_out
+                        new_tail = None
+                else:
+                    if use_temporal_overlap and new_out.shape[0] > temporal_overlap:
+                        frames_to_write = new_out[:-temporal_overlap]
+                        new_tail = new_out[-temporal_overlap:]
+                    else:
+                        frames_to_write = new_out
+                        new_tail = None
+
+            if use_temporal_overlap and chunk_len > 0:
+                take = min(temporal_overlap, chunk_len)
+                prev_input_tail = frames_tensor[-take:].detach().clone().contiguous()
+            else:
+                prev_input_tail = None
+
+            if new_tail is not None:
+                prev_output_tail = new_tail.detach().clone().contiguous()
+            else:
+                prev_output_tail = None
+
+            if frames_to_write is not None and frames_to_write.shape[0] > 0:
+                frames_to_write = frames_to_write.contiguous()
+                frames_np_out = (frames_to_write.numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                T, H, W, C = frames_np_out.shape
+
+                if writer is None:
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    writer = cv2.VideoWriter(final_output_path, fourcc, fps, (W, H))
+                    if not writer.isOpened():
+                        raise ValueError(f"Cannot create video writer for: {final_output_path}")
+
+                for i in range(T):
+                    frame_rgb = frames_np_out[i]
+                    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                    writer.write(frame_bgr)
+
+                debug.log(
+                    f"Chunk {chunk_index}: wrote {T} frames (total processed: {total_frames_processed})",
+                    category="file",
+                )
+
+            chunk_index += 1
     finally:
         cap.release()
         if writer is not None:
+            if use_temporal_overlap and prev_output_tail is not None and prev_output_tail.shape[0] > 0:
+                tail_np = (prev_output_tail.contiguous().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                T_tail, H_tail, W_tail, C_tail = tail_np.shape
+                for i in range(T_tail):
+                    frame_rgb = tail_np[i]
+                    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                    writer.write(frame_bgr)
+
             writer.release()
 
     debug.log(f"Output saved to: {final_output_path}", category="file", force=True)
