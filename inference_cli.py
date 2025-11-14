@@ -391,15 +391,19 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     # Show format with auto-detection indicator
     format_prefix = "Auto-detected" if format_auto_detected else "Requested"
     debug.log(f"{format_prefix} output format: {args.output_format}", category="info", force=True, indent_level=1)
-    
+
     # Process frames
     processing_start = time.time()
-    # Use direct processing if caching enabled
-    if runner_cache is not None:
-        # Direct single-GPU processing with model caching
-        result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
+    
+    # Decide processing strategy based on number of GPUs
+    single_gpu = len(device_list) == 1
+
+    if single_gpu:
+        # Always use direct single-GPU processing in the main process
+        cache = runner_cache or {}
+        result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], cache)
     else:
-        # Multi-GPU or non-cached processing via worker processes
+        # Multi-GPU processing via worker processes
         result = _gpu_processing(frames_tensor, device_list, args)
     debug.log(f"Processing time: {time.time() - processing_start:.2f}s", category="timing")
 
