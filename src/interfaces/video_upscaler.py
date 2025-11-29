@@ -529,7 +529,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             debug.log_memory_state("After all phases complete", show_tensors=False, detailed_tensors=False)
             
             # Final peak vram summary
-            debug.log_peak_vram_summary()
+            debug.log_peak_memory_summary()
 
             # Final timing summary
             debug.log("", category="none")
