@@ -78,23 +78,25 @@ if platform.system() != "Darwin":
     if _pre_args.cuda_device is not None:
         device_list_env = [x.strip() for x in _pre_args.cuda_device.split(',') if x.strip()!='']
         
-        # Temporary torch import for CUDA device validation only
-        # Must happen before setting CUDA_VISIBLE_DEVICES and before main torch import
-        import torch as _torch_check
-        if _torch_check.cuda.is_available():
-            available_count = _torch_check.cuda.device_count()
-            invalid_devices = [d for d in device_list_env if not d.isdigit() or int(d) >= available_count]
-            if invalid_devices:
-                print(f"❌ [ERROR] Invalid CUDA device ID(s): {', '.join(invalid_devices)}. "
-                      f"Available devices: 0-{available_count-1} (total: {available_count})")
+        # Skip validation if CUDA_VISIBLE_DEVICES is already set (worker process)
+        if os.environ.get("CUDA_VISIBLE_DEVICES") is None:
+            # Temporary torch import for CUDA device validation only
+            # Must happen before setting CUDA_VISIBLE_DEVICES and before main torch import
+            import torch as _torch_check
+            if _torch_check.cuda.is_available():
+                available_count = _torch_check.cuda.device_count()
+                invalid_devices = [d for d in device_list_env if not d.isdigit() or int(d) >= available_count]
+                if invalid_devices:
+                    print(f"❌ [ERROR] Invalid CUDA device ID(s): {', '.join(invalid_devices)}. "
+                        f"Available devices: 0-{available_count-1} (total: {available_count})")
+                    sys.exit(1)
+            else:
+                print("❌ [ERROR] CUDA is not available on this system. Cannot use --cuda_device argument.")
                 sys.exit(1)
-        else:
-            print("❌ [ERROR] CUDA is not available on this system. Cannot use --cuda_device argument.")
-            sys.exit(1)
-        
-        # Set CUDA_VISIBLE_DEVICES for single GPU after validation
-        if len(device_list_env) == 1:
-            os.environ["CUDA_VISIBLE_DEVICES"] = device_list_env[0]
+            
+            # Set CUDA_VISIBLE_DEVICES for single GPU after validation
+            if len(device_list_env) == 1:
+                os.environ["CUDA_VISIBLE_DEVICES"] = device_list_env[0]
 
 # Heavy dependency imports after environment configuration
 import torch
@@ -1064,9 +1066,9 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     
     # Process frames
     processing_start = time.time()
-    # Use direct processing if caching enabled
-    if runner_cache is not None:
-        # Direct single-GPU processing with model caching
+    # Use direct processing if caching enabled OR on Mac (MPS doesn't support multiprocessing well)
+    if runner_cache is not None or platform.system() == "Darwin":
+        # Direct single-GPU processing (required for Mac MPS, optional for caching)
         result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
     else:
         # Multi-GPU or non-cached processing via worker processes
@@ -1533,15 +1535,11 @@ def _worker_process(
     """
     Worker process for multi-GPU upscaling.
     
-    Sets up isolated CUDA environment and calls core processing logic.
-    Results returned via multiprocessing queue as numpy arrays.
+    CUDA_VISIBLE_DEVICES is set by parent before spawn, so this worker
+    only sees its assigned GPU. Results returned via queue as numpy arrays.
     """
-    if platform.system() != "Darwin":
-        # Limit CUDA visibility to the chosen GPU BEFORE importing torch
-        os.environ["CUDA_VISIBLE_DEVICES"] = device_id
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
-
-    import torch
+    # Note: CUDA_VISIBLE_DEVICES and PYTORCH_CUDA_ALLOC_CONF are inherited
+    # from parent (set before spawn). torch is imported at module level.
     
     # Create debug instance for this worker
     worker_debug = Debug(enabled=shared_args["debug"])
@@ -1556,7 +1554,7 @@ def _worker_process(
     result_tensor = _process_frames_core(
         frames_tensor=frames_tensor,
         args=args,
-        device_id="0",  # Always "0" in worker (CUDA_VISIBLE_DEVICES set)
+        device_id="0",  # Worker sees only 1 GPU (index 0) due to CUDA_VISIBLE_DEVICES
         debug=worker_debug,
         runner_cache=None  # No caching in multiprocessing mode
     )
@@ -1650,6 +1648,9 @@ def _gpu_processing(
 
     # Start all workers
     for idx, (device_id, chunk_tensor) in enumerate(zip(device_list, chunks)):
+        # Set CUDA_VISIBLE_DEVICES before spawning so child inherits it
+        os.environ["CUDA_VISIBLE_DEVICES"] = device_id
+        
         p = mp.Process(
             target=_worker_process,
             args=(idx, device_id, chunk_tensor.cpu().numpy(), shared_args, return_queue),
