@@ -413,6 +413,13 @@ def process_video_in_chunks_single_gpu(
     max_chunk = args.load_cap
     chunk_overlap = max(0, args.chunk_overlap)
 
+    if args.temporal_overlap > 0 and chunk_overlap < args.temporal_overlap:
+        cli_log_debug(
+            f"Raising chunk_overlap from {chunk_overlap} to {args.temporal_overlap} "
+            "to satisfy temporal_overlap for chunk stitching."
+        )
+        chunk_overlap = args.temporal_overlap
+
     chunk_plans: List[Dict[str, int]] = []
     temp_frames_consumed = skipped
     remaining_frames = max(0, total_frames - skipped)
@@ -557,7 +564,16 @@ def process_video_in_chunks_single_gpu(
             f"Chunk {chunk_index} produced {upscaled_np.shape[0]} frames (T={chunk_len} + context={overlap_context})."
         )
 
-        drop_count = overlap_context if chunk_index > 1 else 0
+        if chunk_index > 1:
+            if args.temporal_overlap > 0:
+                # We keep `temporal_overlap` worth of boundary frames via carryover+blend,
+                # so only drop the extra context beyond that.
+                drop_count = max(0, overlap_context - args.temporal_overlap)
+            else:
+                # No temporal blending – drop all context frames.
+                drop_count = overlap_context
+        else:
+            drop_count = 0
         if drop_count > 0:
             total_overlap_frames_removed += drop_count
             cli_log_debug(
@@ -565,7 +581,7 @@ def process_video_in_chunks_single_gpu(
             )
 
         if carryover is not None:
-            blend_overlap = min(args.temporal_overlap, drop_count, carryover.shape[0], upscaled_np.shape[0])
+            blend_overlap = min(args.temporal_overlap, carryover.shape[0], upscaled_np.shape[0])
             if blend_overlap > 0:
                 prev_tail = torch.from_numpy(carryover[-blend_overlap:]).to(torch.float32) / 255.0
                 cur_head = torch.from_numpy(upscaled_np[:blend_overlap]).to(torch.float32) / 255.0
@@ -682,6 +698,13 @@ def process_video_in_chunks_multi_gpu(
 
     max_chunk = args.load_cap
     chunk_overlap = max(0, args.chunk_overlap)
+
+    if args.temporal_overlap > 0 and chunk_overlap < args.temporal_overlap:
+        cli_log_debug(
+            f"Raising chunk_overlap from {chunk_overlap} to {args.temporal_overlap} "
+            "to satisfy temporal_overlap for chunk stitching."
+        )
+        chunk_overlap = args.temporal_overlap
 
     chunk_plans: List[Dict[str, int]] = []
     temp_frames_consumed = skipped
@@ -826,7 +849,16 @@ def process_video_in_chunks_multi_gpu(
             f"Chunk {chunk_index} produced {upscaled_np.shape[0]} frames (T={chunk_len} + context={overlap_context})."
         )
 
-        drop_count = overlap_context if chunk_index > 1 else 0
+        if chunk_index > 1:
+            if args.temporal_overlap > 0:
+                # We keep `temporal_overlap` worth of boundary frames via carryover+blend,
+                # so only drop the extra context beyond that.
+                drop_count = max(0, overlap_context - args.temporal_overlap)
+            else:
+                # No temporal blending – drop all context frames.
+                drop_count = overlap_context
+        else:
+            drop_count = 0
         if drop_count > 0:
             total_overlap_frames_removed += drop_count
             cli_log_debug(
@@ -834,7 +866,7 @@ def process_video_in_chunks_multi_gpu(
             )
 
         if carryover is not None:
-            blend_overlap = min(args.temporal_overlap, drop_count, carryover.shape[0], upscaled_np.shape[0])
+            blend_overlap = min(args.temporal_overlap, carryover.shape[0], upscaled_np.shape[0])
             if blend_overlap > 0:
                 prev_tail = torch.from_numpy(carryover[-blend_overlap:]).to(torch.float32) / 255.0
                 cur_head = torch.from_numpy(upscaled_np[:blend_overlap]).to(torch.float32) / 255.0
