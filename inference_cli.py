@@ -48,7 +48,9 @@ import argparse
 import time
 import platform
 import multiprocessing as mp
-from typing import Dict, Any, List, Optional, Tuple, Literal
+import importlib.util
+import logging
+from typing import Dict, Any, List, Optional, Tuple, Literal, Union, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -106,15 +108,20 @@ else:
 import torch
 import cv2
 import numpy as np
+_psutil_spec = importlib.util.find_spec("psutil")
+if _psutil_spec:
+    import psutil  # type: ignore
+else:
+    psutil = None  # type: ignore
 
 # Project imports
 from src.utils.downloads import download_weight
 from src.utils.model_registry import get_available_dit_models, DEFAULT_DIT, DEFAULT_VAE
 from src.utils.constants import SEEDVR2_FOLDER_NAME
 from src.core.generation_utils import (
-    setup_generation_context, 
-    prepare_runner, 
-    compute_generation_info, 
+    setup_generation_context,
+    prepare_runner,
+    compute_generation_info,
     log_generation_start,
     blend_overlapping_frames
 )
@@ -126,6 +133,31 @@ from src.core.generation_phases import (
 )
 from src.utils.debug import Debug
 debug = Debug(enabled=False)  # Will be enabled via --debug CLI flag
+
+logger = logging.getLogger("seedvr2.cli")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+
+def cli_log_info(message: str) -> None:
+    """
+    CLI-facing info logger with SeedVR2-style timestamp prefix:
+    [HH:MM:SS.mmm] <message>
+    """
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]  # e.g. 11:50:27.039
+    logger.info(f"[{ts}] {message}")
+
+
+def cli_log_debug(message: str) -> None:
+    """
+    CLI-facing debug logger with SeedVR2-style timestamp prefix:
+    [HH:MM:SS.mmm] <message>
+    Only emits when --debug is enabled.
+    """
+    if not debug.enabled:
+        return
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    logger.info(f"[{ts}] {message}")
 
 
 # =============================================================================
@@ -205,6 +237,612 @@ IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'}
 # =============================================================================
 # Video I/O Functions
 # =============================================================================
+
+
+def _estimate_chunk_memory_bytes(width: int, height: int, load_cap: int) -> int:
+    """Rough estimate of memory footprint for a single chunk in bytes."""
+    return int(width) * int(height) * 4 * 4 * int(load_cap)
+
+
+def _log_chunk_memory_warning(width: int, height: int, load_cap: int) -> None:
+    """Warn the user if a single chunk is likely to be memory-intensive."""
+    if load_cap <= 0:
+        return
+
+    chunk_bytes = _estimate_chunk_memory_bytes(width, height, load_cap)
+    if psutil is not None:
+        total_ram = psutil.virtual_memory().total
+    else:
+        total_ram = 48 * (1024 ** 3)
+
+    threshold = int(total_ram * 0.6)
+    if chunk_bytes >= threshold:
+        chunk_gb = chunk_bytes / (1024 ** 3)
+        total_gb = total_ram / (1024 ** 3)
+        debug.log(
+            (
+                f"WARNING: load_cap={load_cap} at resolution {width}x{height} may require ~{chunk_gb:.2f} GB RAM "
+                f"for a single chunk (system memory ~{total_gb:.2f} GB). Consider reducing --load_cap or chunked mode "
+                f"may OOM."
+            ),
+            category="memory",
+            force=True,
+        )
+
+
+def _log_chunk_plan_banner(
+    logger: logging.Logger,
+    total_frames: int,
+    num_chunks: int,
+    load_cap: int,
+    chunk_overlap: int,
+    temporal_overlap: int,
+    mode: str,
+) -> None:
+    """
+    One-time concise summary for chunked mode (INFO level).
+    Shown even when --debug is off.
+    """
+    cli_log_info(
+        f"🧩 Chunked {mode} mode: {num_chunks} chunks "
+        f"(total frames={total_frames}, load_cap={load_cap}, "
+        f"chunk_overlap={chunk_overlap}, temporal_overlap={temporal_overlap})"
+    )
+
+
+def _log_chunk_plan_debug(
+    chunk_plans: Sequence[Mapping[str, int]],
+    mode: str,
+) -> None:
+    """
+    Detailed chunk plan (DEBUG logger via DebugLogger).
+    Only called when debug.enabled is True.
+
+    Each element in chunk_plans must contain at least:
+        idx, start, end, length, head_ctx, tail_ctx,
+        write_start, write_end
+    where ranges are inclusive indices in input frame space.
+    """
+    if not debug.enabled:
+        return
+
+    total = len(chunk_plans)
+    cli_log_debug(f"Planned {total} chunk(s) for {mode} mode:")
+    cli_log_debug("  • Planned chunks: %d" % total)
+
+    for p in chunk_plans:
+        idx = p["idx"]
+        start = p["start"]
+        end = p["end"]
+        length = p["length"]
+        head_ctx = p["head_ctx"]
+        tail_ctx = p["tail_ctx"]
+        write_start = p["write_start"]
+        write_end = p["write_end"]
+        cli_log_debug(
+            (
+                f"    - Chunk {idx}/{total}: "
+                f"input frames {start}–{end} "
+                f"(len={length}, context: head={head_ctx}, tail={tail_ctx}, "
+                f"effective write range: {write_start}–{write_end})"
+            )
+        )
+
+
+def read_video_chunk(cap: cv2.VideoCapture, max_frames: int) -> Optional[torch.Tensor]:
+    """
+    Read up to max_frames frames from an open VideoCapture into a normalized tensor.
+
+    Args:
+        cap: An already opened cv2.VideoCapture instance.
+        max_frames: Maximum number of frames to read in this call.
+
+    Returns:
+        Tensor with shape [T, H, W, C] in float32 range [0, 1] if frames are read,
+        otherwise None when no frames remain.
+    """
+    frames: List[np.ndarray] = []
+
+    for _ in range(max_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = frame.astype(np.float32) / 255.0
+        frames.append(frame)
+
+    if not frames:
+        return None
+
+    return torch.stack([torch.from_numpy(f) for f in frames]).to(torch.float32)
+
+
+def process_video_in_chunks_single_gpu(
+    input_path: Union[str, Path],
+    args: argparse.Namespace,
+    device_id: str,
+    output_path: Union[str, Path],
+    runner_cache: Optional[Dict[str, Any]] = None,
+) -> int:
+    """
+    Process a video in temporal chunks on a single GPU using chunked_mode settings.
+
+    This uses args.load_cap as the maximum new frames per chunk while reusing
+    chunk_overlap tail frames from the previous chunk as context. Overlapped
+    frames are re-processed for temporal context but only written once in the
+    stitched output.
+
+    Returns the total number of frames written.
+    """
+
+    video_start_ts = time.time()
+
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video file: {input_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    cli_log_debug(
+        f"Chunked processing enabled: {total_frames} frames, {width}x{height}, {fps:.2f} FPS"
+    )
+
+    _log_chunk_memory_warning(width, height, args.load_cap)
+
+    if args.skip_first_frames > 0:
+        cli_log_debug(
+            f"Skipping first {args.skip_first_frames} frames globally before chunking begins."
+        )
+
+    if args.skip_first_frames > 0:
+        skipped = 0
+        for _ in range(args.skip_first_frames):
+            ret, _ = cap.read()
+            if not ret:
+                break
+            skipped += 1
+        cli_log_debug(f"Skipped first {skipped} frames before chunking")
+    else:
+        skipped = 0
+
+    is_png = args.output_format == "png"
+    out_video = None
+    expected_width: Optional[int] = None
+    expected_height: Optional[int] = None
+    if is_png:
+        os.makedirs(output_path, exist_ok=True)
+
+    max_chunk = args.load_cap
+    chunk_overlap = max(0, args.chunk_overlap)
+
+    chunk_plans: List[Dict[str, int]] = []
+    temp_frames_consumed = skipped
+    remaining_frames = max(0, total_frames - skipped)
+    prev_chunk_len = 0
+
+    while remaining_frames > 0:
+        chunk_len = min(max_chunk, remaining_frames)
+        head_ctx = min(chunk_overlap, prev_chunk_len) if prev_chunk_len > 0 else 0
+        chunk_input_start = temp_frames_consumed - head_ctx
+        chunk_input_end = temp_frames_consumed + chunk_len - 1
+        length = chunk_input_end - chunk_input_start + 1
+        tail_ctx = min(chunk_overlap, chunk_len) if remaining_frames - chunk_len > 0 else 0
+        write_start = chunk_input_start + (head_ctx if chunk_plans else 0)
+        write_end = chunk_input_end
+
+        chunk_plans.append(
+            {
+                "idx": len(chunk_plans) + 1,
+                "start": chunk_input_start,
+                "end": chunk_input_end,
+                "length": length,
+                "head_ctx": head_ctx,
+                "tail_ctx": tail_ctx,
+                "write_start": write_start,
+                "write_end": write_end,
+            }
+        )
+
+        prev_chunk_len = chunk_len
+        temp_frames_consumed += chunk_len
+        remaining_frames -= chunk_len
+
+    num_chunks = len(chunk_plans)
+
+    _log_chunk_plan_banner(
+        logger,
+        total_frames=total_frames,
+        num_chunks=num_chunks,
+        load_cap=max_chunk,
+        chunk_overlap=chunk_overlap,
+        temporal_overlap=args.temporal_overlap,
+        mode="single-GPU",
+    )
+    _log_chunk_plan_debug(chunk_plans, mode="single-GPU")
+
+    chunk_index = 0
+    processed_frames = 0
+    frames_consumed = skipped
+    prev_raw_tail: Optional[torch.Tensor] = None
+    total_overlap_frames_removed = 0
+
+    total_padding_removed = 0
+
+    while True:
+        new_frames_tensor = read_video_chunk(cap, max_chunk)
+        if new_frames_tensor is None:
+            cli_log_debug(f"No frames returned for chunk {chunk_index + 1}; stopping.")
+            break
+
+        chunk_index += 1
+        chunk_len = new_frames_tensor.shape[0]
+
+        overlap_context = 0
+        if chunk_overlap > 0 and prev_raw_tail is not None and prev_raw_tail.shape[0] > 0:
+            overlap_context = min(chunk_overlap, prev_raw_tail.shape[0])
+
+        if overlap_context > 0:
+            frames_tensor = torch.cat([prev_raw_tail[-overlap_context:], new_frames_tensor], dim=0)
+        else:
+            frames_tensor = new_frames_tensor
+
+        global_start = frames_consumed - overlap_context
+        global_end = frames_consumed + chunk_len - 1
+        overlap_msg = f" (chunk_overlap={overlap_context})" if overlap_context > 0 else ""
+        cli_log_debug(
+            f"Processing chunk {chunk_index}: raw input frames [{global_start}..{global_end}]{overlap_msg}"
+        )
+        if chunk_len < max_chunk:
+            cli_log_debug(f"Final chunk detected (size={chunk_len} < load_cap={max_chunk})")
+
+        plan_idx = chunk_index - 1
+        chunk_input_start = chunk_plans[plan_idx]["start"] if plan_idx < len(chunk_plans) else global_start
+        chunk_input_end = chunk_plans[plan_idx]["end"] if plan_idx < len(chunk_plans) else global_end
+
+        chunk_start_ts = time.time()
+        cli_log_info(
+            f"🧩 Chunk {chunk_index}/{num_chunks}: starting "
+            f"(input frames {chunk_input_start}–{chunk_input_end})"
+        )
+
+        upscaled = _single_gpu_direct_processing(frames_tensor, args, device_id, runner_cache)
+        upscaled_np = (upscaled.cpu().numpy() * 255.0).astype(np.uint8)
+        cli_log_debug(
+            f"Chunk {chunk_index} produced {upscaled_np.shape[0]} frames (T={chunk_len} + context={overlap_context})."
+        )
+
+        drop_count = overlap_context if chunk_index > 1 else 0
+        if drop_count > 0:
+            total_overlap_frames_removed += drop_count
+            cli_log_debug(
+                f"Dropping {drop_count} overlapped context frame(s) from chunk {chunk_index} output (already covered by previous chunk)."
+            )
+        write_frames = upscaled_np[drop_count:]
+
+        if not is_png:
+            if write_frames.shape[0] == 0:
+                frames_consumed += chunk_len
+                continue
+
+            H_out, W_out = write_frames.shape[1:3]
+
+            if out_video is None:
+                expected_width, expected_height = W_out, H_out
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                out_video = cv2.VideoWriter(str(output_path), fourcc, fps, (expected_width, expected_height))
+                if not out_video.isOpened():
+                    cap.release()
+                    raise ValueError(f"Cannot create video writer for: {output_path}")
+            else:
+                if expected_width is not None and expected_height is not None:
+                    if (W_out, H_out) != (expected_width, expected_height):
+                        if out_video is not None:
+                            out_video.release()
+                        cap.release()
+                        raise RuntimeError(
+                            f"Upscaled frame size {W_out}x{H_out} does not match expected VideoWriter size {expected_width}x{expected_height} for chunk {chunk_index}."
+                        )
+
+        if is_png:
+            written = save_frames_to_png_chunk(output_path, write_frames, processed_frames)
+            if written > 0:
+                start_idx = processed_frames
+                end_idx = processed_frames + written - 1
+                cli_log_debug(
+                    f"Wrote PNG frames [{start_idx}..{end_idx}] for chunk {chunk_index}"
+                )
+            processed_frames += written
+        else:
+            start_idx = processed_frames
+            for frame in write_frames:
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                out_video.write(frame_bgr)
+            processed_frames += write_frames.shape[0]
+            end_idx = processed_frames - 1 if write_frames.shape[0] > 0 else processed_frames
+            cli_log_debug(
+                f"Wrote {write_frames.shape[0]} frames to MP4 for chunk {chunk_index} (frames {start_idx}..{end_idx})"
+            )
+
+        if chunk_overlap > 0:
+            prev_raw_tail = new_frames_tensor[-chunk_overlap:].clone()
+        else:
+            prev_raw_tail = None
+
+        frames_consumed += chunk_len
+
+        chunk_elapsed = time.time() - chunk_start_ts
+        total_elapsed = time.time() - video_start_ts
+        completed = chunk_index
+        remaining = num_chunks - completed
+        eta = (total_elapsed / completed) * remaining if completed > 0 else 0.0
+        cli_log_info(
+            f"🧩 Chunk {completed}/{num_chunks} completed in {chunk_elapsed:.1f}s "
+            f"(elapsed {total_elapsed:.1f}s, ETA {eta:.1f}s)"
+        )
+
+    if out_video is not None:
+        out_video.release()
+    cap.release()
+
+    cli_log_info(
+        "🧩 Chunked single-GPU summary: "
+        f"{num_chunks} chunks, {total_frames} input frames → {processed_frames} output frames "
+        f"(padding removed={total_padding_removed}, overlap reused={total_overlap_frames_removed})"
+    )
+
+    cli_log_debug(f"Chunked processing complete. Total frames written: {processed_frames}")
+
+    return processed_frames
+
+
+def process_video_in_chunks_multi_gpu(
+    input_path: Union[str, Path],
+    args: argparse.Namespace,
+    device_list: List[str],
+    output_path: Union[str, Path],
+) -> int:
+    """
+    Process a video in temporal chunks on multiple GPUs using chunked_mode settings.
+
+    This uses args.load_cap as the maximum new frames per chunk while reusing
+    chunk_overlap tail frames from the previous chunk as context. Overlapped
+    frames are re-processed for temporal context but only written once in the
+    stitched output.
+
+    Returns the total number of frames written.
+    """
+
+    video_start_ts = time.time()
+
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video file: {input_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    cli_log_debug(
+        f"Chunked multi-GPU processing: {total_frames} frames, {width}x{height}, {fps:.2f} FPS"
+    )
+
+    _log_chunk_memory_warning(width, height, args.load_cap)
+
+    if args.skip_first_frames > 0:
+        cli_log_debug(
+            f"Skipping first {args.skip_first_frames} frames globally before chunking begins."
+        )
+
+    if args.skip_first_frames > 0:
+        skipped = 0
+        for _ in range(args.skip_first_frames):
+            ret, _ = cap.read()
+            if not ret:
+                break
+            skipped += 1
+        cli_log_debug(f"Skipped first {skipped} frames before chunking")
+    else:
+        skipped = 0
+
+    is_png = args.output_format == "png"
+    out_video = None
+    expected_width: Optional[int] = None
+    expected_height: Optional[int] = None
+    if is_png:
+        os.makedirs(output_path, exist_ok=True)
+
+    max_chunk = args.load_cap
+    chunk_overlap = max(0, args.chunk_overlap)
+
+    chunk_plans: List[Dict[str, int]] = []
+    temp_frames_consumed = skipped
+    remaining_frames = max(0, total_frames - skipped)
+    prev_chunk_len = 0
+
+    while remaining_frames > 0:
+        chunk_len = min(max_chunk, remaining_frames)
+        head_ctx = min(chunk_overlap, prev_chunk_len) if prev_chunk_len > 0 else 0
+        chunk_input_start = temp_frames_consumed - head_ctx
+        chunk_input_end = temp_frames_consumed + chunk_len - 1
+        length = chunk_input_end - chunk_input_start + 1
+        tail_ctx = min(chunk_overlap, chunk_len) if remaining_frames - chunk_len > 0 else 0
+        write_start = chunk_input_start + (head_ctx if chunk_plans else 0)
+        write_end = chunk_input_end
+
+        chunk_plans.append(
+            {
+                "idx": len(chunk_plans) + 1,
+                "start": chunk_input_start,
+                "end": chunk_input_end,
+                "length": length,
+                "head_ctx": head_ctx,
+                "tail_ctx": tail_ctx,
+                "write_start": write_start,
+                "write_end": write_end,
+            }
+        )
+
+        prev_chunk_len = chunk_len
+        temp_frames_consumed += chunk_len
+        remaining_frames -= chunk_len
+
+    num_chunks = len(chunk_plans)
+
+    _log_chunk_plan_banner(
+        logger,
+        total_frames=total_frames,
+        num_chunks=num_chunks,
+        load_cap=max_chunk,
+        chunk_overlap=chunk_overlap,
+        temporal_overlap=args.temporal_overlap,
+        mode="multi-GPU",
+    )
+    _log_chunk_plan_debug(chunk_plans, mode="multi-GPU")
+
+    chunk_index = 0
+    processed_frames = 0
+    frames_consumed = skipped
+    prev_raw_tail: Optional[torch.Tensor] = None
+    total_overlap_frames_removed = 0
+    total_padding_removed = 0
+
+    while True:
+        new_frames_tensor = read_video_chunk(cap, max_chunk)
+        if new_frames_tensor is None:
+            cli_log_debug(f"No frames returned for chunk {chunk_index + 1}; stopping.")
+            break
+
+        chunk_index += 1
+        chunk_len = new_frames_tensor.shape[0]
+
+        overlap_context = 0
+        if chunk_overlap > 0 and prev_raw_tail is not None and prev_raw_tail.shape[0] > 0:
+            overlap_context = min(chunk_overlap, prev_raw_tail.shape[0])
+
+        if overlap_context > 0:
+            frames_tensor = torch.cat([prev_raw_tail[-overlap_context:], new_frames_tensor], dim=0)
+        else:
+            frames_tensor = new_frames_tensor
+
+        global_start = frames_consumed - overlap_context
+        global_end = frames_consumed + chunk_len - 1
+        overlap_msg = f" (chunk_overlap={overlap_context})" if overlap_context > 0 else ""
+        cli_log_debug(
+            f"Processing chunk {chunk_index}: raw input frames [{global_start}..{global_end}]{overlap_msg}"
+        )
+        if chunk_len < max_chunk:
+            cli_log_debug(f"Final chunk detected (size={chunk_len} < load_cap={max_chunk})")
+
+        plan_idx = chunk_index - 1
+        chunk_input_start = chunk_plans[plan_idx]["start"] if plan_idx < len(chunk_plans) else global_start
+        chunk_input_end = chunk_plans[plan_idx]["end"] if plan_idx < len(chunk_plans) else global_end
+
+        chunk_start_ts = time.time()
+        cli_log_info(
+            f"🧩 Chunk {chunk_index}/{num_chunks}: starting "
+            f"(input frames {chunk_input_start}–{chunk_input_end})"
+        )
+
+        upscaled = _gpu_processing(frames_tensor, device_list, args)
+        upscaled_np = (upscaled.cpu().numpy() * 255.0).astype(np.uint8)
+        cli_log_debug(
+            f"Chunk {chunk_index} produced {upscaled_np.shape[0]} frames (T={chunk_len} + context={overlap_context})."
+        )
+
+        drop_count = overlap_context if chunk_index > 1 else 0
+        if drop_count > 0:
+            total_overlap_frames_removed += drop_count
+            cli_log_debug(
+                f"Dropping {drop_count} overlapped context frame(s) from chunk {chunk_index} output (already covered by previous chunk)."
+            )
+        write_frames = upscaled_np[drop_count:]
+
+        if not is_png:
+            if write_frames.shape[0] == 0:
+                frames_consumed += chunk_len
+                continue
+
+            H_out, W_out = write_frames.shape[1:3]
+
+            if out_video is None:
+                expected_width, expected_height = W_out, H_out
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                out_video = cv2.VideoWriter(str(output_path), fourcc, fps, (expected_width, expected_height))
+                if not out_video.isOpened():
+                    cap.release()
+                    raise ValueError(f"Cannot create video writer for: {output_path}")
+            else:
+                if expected_width is not None and expected_height is not None:
+                    if (W_out, H_out) != (expected_width, expected_height):
+                        if out_video is not None:
+                            out_video.release()
+                        cap.release()
+                        raise RuntimeError(
+                            f"Upscaled frame size {W_out}x{H_out} does not match expected VideoWriter size {expected_width}x{expected_height} for chunk {chunk_index}."
+                        )
+
+        if is_png:
+            written = save_frames_to_png_chunk(output_path, write_frames, processed_frames)
+            if written > 0:
+                start_idx = processed_frames
+                end_idx = processed_frames + written - 1
+                cli_log_debug(
+                    f"Wrote PNG frames [{start_idx}..{end_idx}] for chunk {chunk_index}"
+                )
+            processed_frames += written
+        else:
+            start_idx = processed_frames
+            for frame in write_frames:
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                out_video.write(frame_bgr)
+            processed_frames += write_frames.shape[0]
+            end_idx = processed_frames - 1 if write_frames.shape[0] > 0 else processed_frames
+            cli_log_debug(
+                f"Wrote {write_frames.shape[0]} frames to MP4 for chunk {chunk_index} (frames {start_idx}..{end_idx})"
+            )
+
+        if chunk_overlap > 0:
+            prev_raw_tail = new_frames_tensor[-chunk_overlap:].clone()
+        else:
+            prev_raw_tail = None
+
+        frames_consumed += chunk_len
+
+        chunk_elapsed = time.time() - chunk_start_ts
+        total_elapsed = time.time() - video_start_ts
+        completed = chunk_index
+        remaining = num_chunks - completed
+        eta = (total_elapsed / completed) * remaining if completed > 0 else 0.0
+        cli_log_info(
+            f"🧩 Chunk {completed}/{num_chunks} completed in {chunk_elapsed:.1f}s "
+            f"(elapsed {total_elapsed:.1f}s, ETA {eta:.1f}s)"
+        )
+
+    if out_video is not None:
+        out_video.release()
+    cap.release()
+
+    cli_log_info(
+        "🧩 Chunked multi-GPU summary: "
+        f"{num_chunks} chunks, {total_frames} input frames → {processed_frames} output frames "
+        f"(padding removed={total_padding_removed}, overlap reused={total_overlap_frames_removed})"
+    )
+
+    cli_log_debug(
+        f"Chunked multi-GPU processing complete. Total frames written: {processed_frames}"
+    )
+
+    return processed_frames
+
 
 def get_media_files(directory: str) -> List[str]:
     """
@@ -350,7 +988,7 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
     return str(output_path.resolve())
 
 
-def process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str], 
+def process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str],
                        output_path: Optional[str] = None, format_auto_detected: bool = False,
                        runner_cache: Optional[Dict[str, Any]] = None) -> int:
     """
@@ -372,9 +1010,53 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     if input_type == "unknown":
         debug.log(f"Skipping unsupported file: {input_path}", level="WARNING", category="file", force=True)
         return 0
-    
+
     debug.log(f"Processing {input_type}: {Path(input_path).name}", category="generation", force=True)
-    
+
+    if output_path is None:
+        output_path = generate_output_path(input_path, args.output_format, input_type=input_type)
+    elif not Path(output_path).suffix or (args.output_format == "png" and input_type != "image"):
+        output_path = generate_output_path(input_path, args.output_format,
+                                         output_dir=output_path, input_type=input_type)
+
+    format_prefix = "Auto-detected" if format_auto_detected else "Requested"
+    debug.log(f"{format_prefix} output format: {args.output_format}", category="info", force=True, indent_level=1)
+
+    if input_type == "video" and args.chunked_mode and args.load_cap > 0:
+        chunk_args = args
+        if args.load_cap < args.prepend_frames + args.temporal_overlap:
+            debug.log(
+                "load_cap is too small for prepend_frames + temporal_overlap; adjusting prepend_frames to 0 for chunked mode.",
+                category="setup",
+                force=True,
+            )
+            chunk_args = argparse.Namespace(**vars(args))
+            chunk_args.prepend_frames = 0
+
+        if len(device_list) == 1:
+            debug.log("Using single-GPU chunked processing", category="setup")
+            frames_written = process_video_in_chunks_single_gpu(
+                input_path,
+                chunk_args,
+                device_list[0],
+                output_path,
+                runner_cache=runner_cache,
+            )
+        else:
+            debug.log("Using multi-GPU chunked processing", category="setup")
+            frames_written = process_video_in_chunks_multi_gpu(
+                input_path,
+                chunk_args,
+                device_list,
+                output_path,
+            )
+
+        if args.output_format == "png":
+            debug.log(f"PNG frames saved in directory: {output_path}", category="file", force=True)
+        else:
+            debug.log(f"Output saved to: {output_path}", category="file", force=True)
+        return frames_written
+
     # Extract frames
     if input_type == "video":
         start_time = time.time()
@@ -387,18 +1069,6 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     
     # Track frames before processing (for FPS calculation)
     input_frame_count = len(frames_tensor)
-    
-    # Generate or validate output path
-    if output_path is None:
-        output_path = generate_output_path(input_path, args.output_format, input_type=input_type)
-    elif not Path(output_path).suffix or (args.output_format == "png" and input_type != "image"):
-        # No extension or PNG sequence → treat as directory, generate filename
-        output_path = generate_output_path(input_path, args.output_format, 
-                                         output_dir=output_path, input_type=input_type)
-    
-    # Show format with auto-detection indicator
-    format_prefix = "Auto-detected" if format_auto_detected else "Requested"
-    debug.log(f"{format_prefix} output format: {args.output_format}", category="info", force=True, indent_level=1)
     
     # Process frames
     processing_start = time.time()
@@ -544,8 +1214,8 @@ def extract_frames_from_video(
 
 
 def save_frames_to_video(
-    frames_tensor: torch.Tensor, 
-    output_path: str, 
+    frames_tensor: torch.Tensor,
+    output_path: str,
     fps: float = 30.0
 ) -> None:
     """
@@ -588,13 +1258,57 @@ def save_frames_to_video(
             debug.log(f"Saved {i + 1}/{T} frames", category="file")
 
     out.release()
-    
+
     debug.log(f"Video saved successfully: {output_path}", category="success")
 
 
+def save_frames_to_png_chunk(
+    out_dir: Union[str, Path],
+    frames_np: np.ndarray,
+    start_index: int,
+) -> int:
+    """
+    Save frames as PNG files starting from a global frame index.
+
+    Args:
+        out_dir: Directory to write PNG files (created if missing).
+        frames_np: Frames as uint8 RGB array [T, H, W, C].
+        start_index: Global index for the first frame in this chunk.
+
+    Returns:
+        Number of frames written.
+    """
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    if frames_np.size == 0:
+        return 0
+
+    base_name = Path(out_dir).name
+    if base_name.endswith("_upscaled"):
+        base_name = base_name[: -len("_upscaled")]
+
+    total = frames_np.shape[0]
+    digits = max(5, len(str(start_index + total)))
+
+    for idx, frame in enumerate(frames_np):
+        global_idx = start_index + idx
+        filename = f"{base_name}_{global_idx:0{digits}d}.png"
+        file_path = os.path.join(out_dir, filename)
+
+        if frame.shape[2] == 4:
+            frame_save = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGRA)
+        else:
+            frame_save = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        cv2.imwrite(file_path, frame_save)
+
+    return total
+
+
 def save_frames_to_png(
-    frames_tensor: torch.Tensor, 
-    output_dir: str, 
+    frames_tensor: torch.Tensor,
+    output_dir: str,
     base_name: str
 ) -> None:
     """
@@ -1101,6 +1815,17 @@ Examples:
                         help="Skip N initial frames (default: 0)")
     process_group.add_argument("--load_cap", type=int, default=0,
                         help="Load maximum N frames from video. 0 = load all (default: 0)")
+    process_group.add_argument("--chunked_mode", action="store_true",
+                        help="Enable experimental chunked video processing mode (no effect unless combined with future features).")
+    process_group.add_argument(
+        "--chunk_overlap",
+        type=int,
+        default=16,
+        help=(
+            "Number of frames at the end of each chunk to reuse as temporal context for the next chunk "
+            "(chunked mode only, default: 16). These frames are re-processed for context but only kept once in the final output."
+        ),
+    )
     process_group.add_argument("--prepend_frames", type=int, default=0,
                         help="Prepend N reversed frames to reduce start artifacts (auto-removed). Default: 0")
     process_group.add_argument("--temporal_overlap", type=int, default=0,
