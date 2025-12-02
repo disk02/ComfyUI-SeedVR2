@@ -433,7 +433,10 @@ def prepare_runner(
     tile_debug: str = "false",
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-    torch_compile_args_vae: Optional[Dict[str, Any]] = None
+    torch_compile_args_vae: Optional[Dict[str, Any]] = None,
+    enable_dype: bool = False,
+    dype_lambda_s: float = 1.0,
+    dype_lambda_t: float = 1.0,
 ) -> Tuple['VideoDiffusionInfer', Dict[str, Any]]:
     """
     Prepare runner with model state management and global cache integration.
@@ -460,6 +463,9 @@ def prepare_runner(
         attention_mode: Attention computation backend ('sdpa' or 'flash_attn')
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
+        enable_dype: Enable DyPE configuration plumbing (no effect on outputs yet)
+        dype_lambda_s: DyPE strength parameter (configuration only)
+        dype_lambda_t: DyPE shaping parameter (configuration only)
         
     Returns:
         Tuple['VideoDiffusionInfer', Dict[str, Any]]: Tuple containing:
@@ -503,7 +509,10 @@ def prepare_runner(
         tile_debug=tile_debug,
         attention_mode=attention_mode,
         torch_compile_args_dit=torch_compile_args_dit,
-        torch_compile_args_vae=torch_compile_args_vae
+        torch_compile_args_vae=torch_compile_args_vae,
+        enable_dype=enable_dype,
+        dype_lambda_s=dype_lambda_s,
+        dype_lambda_t=dype_lambda_t
     )
 
     return runner, cache_context

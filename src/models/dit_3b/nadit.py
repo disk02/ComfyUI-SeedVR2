@@ -76,6 +76,9 @@ class NaDiT(nn.Module):
         txt_proj_type: Optional[str] = "linear",
         vid_out_norm: Optional[str] = None,
         attention_mode: str = 'sdpa',
+        enable_dype: bool = False,
+        dype_lambda_s: Optional[float] = None,
+        dype_lambda_t: Optional[float] = None,
         **kwargs,
     ):
         ada = get_ada_layer(ada)
@@ -183,6 +186,10 @@ class NaDiT(nn.Module):
             patch_size=patch_size,
             dim=vid_dim,
         )
+
+        self.enable_dype = enable_dype
+        self.dype_lambda_s = dype_lambda_s
+        self.dype_lambda_t = dype_lambda_t
 
     def set_gradient_checkpointing(self, enable: bool):
         self.gradient_checkpointing = enable

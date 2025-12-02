@@ -34,6 +34,9 @@ dit:
     window_method: ${eval:'${.num_layers} // 2 * ["720pwin_by_size_bysize","720pswin_by_size_bysize"]'} # space-full
     rope_type: mmrope3d
     rope_dim: 128
+    enable_dype: false
+    dype_lambda_s: 1.0      # default DyPE strength parameter (scalar)
+    dype_lambda_t: 1.0      # shaping parameter; no behavior yet
   compile: False
   gradient_checkpoint: True
   fsdp:
