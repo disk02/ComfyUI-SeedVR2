@@ -711,7 +711,7 @@ def upscale_all_batches(
             debug.start_timer(f"dit_inference_{upscale_idx+1}")
             with torch.no_grad():
                 if dit_dtype != ctx['compute_dtype']:
-                    with torch.autocast(str(ctx['dit_device']), ctx['compute_dtype'], enabled=True):
+                    with torch.autocast(ctx['dit_device'].type, ctx['compute_dtype'], enabled=True):
                         upscaled_latents = runner.inference(
                             noises=noises,
                             conditions=conditions,

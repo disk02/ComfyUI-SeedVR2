@@ -15,6 +15,7 @@ from typing import Optional, Tuple, Literal, Callable, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from einops import rearrange
 from ....common.half_precision_fixes import safe_pad_operation
 
@@ -35,7 +36,6 @@ from .types import (
     CausalAutoencoderOutput,
     CausalDecoderOutput,
     CausalEncoderOutput,
-    DiagonalGaussianDistribution,
     MemoryState,
     _inflation_mode_t,
     _memory_device_t,

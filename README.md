@@ -36,6 +36,13 @@ We're actively working on improvements and new features. To stay informed:
 
 ## 🚀 Updates
 
+**2025.12.03 - Version 2.5.15**
+
+- **🍎 Fix: MPS compatibility** - Disable antialias for MPS tensors and fix bfloat16 arange issues
+- **⚡ Fix: Autocast device type** - Use proper device type attribute to prevent autocast errors
+- **📊 Memory: Accurate VRAM tracking** - Use max_memory_reserved for more precise peak reporting
+- **🔧 Fix: Triton compatibility** - Add shim for bitsandbytes 0.45+ / triton 3.0+ (fixes PyTorch 2.7 installation errors)
+
 **2025.12.01 - Version 2.5.14**
 
 - **🍎 Fix: MPS device comparison** - Normalize device strings to prevent unnecessary tensor movements

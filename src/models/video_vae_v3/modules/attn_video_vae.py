@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.attention_processor import Attention, SpatialNorm
+from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
 from diffusers.models.downsampling import Downsample2D
 from diffusers.models.lora import LoRACompatibleConv
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
@@ -45,8 +46,6 @@ from .types import (
     CausalAutoencoderOutput,
     CausalDecoderOutput,
     CausalEncoderOutput,
-    DecoderOutput,
-    DiagonalGaussianDistribution,
     MemoryState,
     _inflation_mode_t,
     _memory_device_t,

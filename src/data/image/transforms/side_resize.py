@@ -56,8 +56,9 @@ class SideResize:
         else:
             size = self.size
 
-        # Resize to shortest edge
-        resized = TVF.resize(image, size, self.interpolation)
+        # Resize to shortest edge (disable antialias only for MPS tensors - not supported)
+        antialias = not (isinstance(image, torch.Tensor) and image.device.type == 'mps')
+        resized = TVF.resize(image, size, self.interpolation, antialias=antialias)
         
         # Apply max_size constraint if specified
         if self.max_size > 0:
@@ -69,6 +70,6 @@ class SideResize:
             if max(h, w) > self.max_size:
                 scale = self.max_size / max(h, w)
                 new_h, new_w = round(h * scale), round(w * scale)
-                resized = TVF.resize(resized, (new_h, new_w), self.interpolation)
+                resized = TVF.resize(resized, (new_h, new_w), self.interpolation, antialias=antialias)
         
         return resized

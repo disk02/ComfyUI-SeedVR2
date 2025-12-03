@@ -155,7 +155,7 @@ class VideoDiffusionInfer():
 
                 # Use autocast if VAE dtype differs from input dtype
                 if vae_dtype != sample.dtype:
-                    with torch.autocast(str(device), sample.dtype, enabled=True):
+                    with torch.autocast(device.type, sample.dtype, enabled=True):
                         if use_sample:
                             latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
                                                     tile_overlap=self.encode_tile_overlap).latent
@@ -231,7 +231,7 @@ class VideoDiffusionInfer():
 
                 # Use autocast if VAE dtype differs from latent dtype
                 if vae_dtype != latent.dtype:
-                    with torch.autocast(str(device), latent.dtype, enabled=True):
+                    with torch.autocast(device.type, latent.dtype, enabled=True):
                         sample = self.vae.decode(
                             latent,
                             tiled=self.decode_tiled, tile_size=self.decode_tile_size,

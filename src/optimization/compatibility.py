@@ -5,6 +5,37 @@ Contains FP8/FP16 compatibility layers and wrappers for different model architec
 Extracted from: seedvr2.py (lines 1045-1630)
 """
 
+# Triton compatibility shim for bitsandbytes 0.45+ with triton 3.0+
+# Must be called before any diffusers import
+import sys
+
+def ensure_triton_compat():
+    """Create minimal triton.ops stubs only if missing, to allow bitsandbytes import."""
+    if 'triton.ops.matmul_perf_model' in sys.modules:
+        return
+    
+    try:
+        from triton.ops.matmul_perf_model import early_config_prune  # noqa: F401
+        return
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        pass
+    
+    import types
+    
+    if 'triton.ops' not in sys.modules:
+        sys.modules['triton.ops'] = types.ModuleType('triton.ops')
+    
+    matmul_perf = types.ModuleType('triton.ops.matmul_perf_model')
+    matmul_perf.early_config_prune = lambda configs, *a, **kw: configs
+    matmul_perf.estimate_matmul_time = lambda *a, **kw: 0.0
+    
+    sys.modules['triton.ops'].matmul_perf_model = matmul_perf
+    sys.modules['triton.ops.matmul_perf_model'] = matmul_perf
+
+# Run immediately on import
+ensure_triton_compat()
+
+
 import torch
 import types
 import os

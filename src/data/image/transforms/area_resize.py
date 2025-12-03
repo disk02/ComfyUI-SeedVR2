@@ -50,10 +50,12 @@ class AreaResize:
 
         resized_height, resized_width = round(height * scale), round(width * scale)
 
+        antialias = not (isinstance(image, torch.Tensor) and image.device.type == 'mps')
         return TVF.resize(
             image,
             size=(resized_height, resized_width),
             interpolation=self.interpolation,
+            antialias=antialias,
         )
 
 

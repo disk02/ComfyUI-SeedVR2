@@ -138,7 +138,7 @@ def get_vram_usage(device: Optional[torch.device] = None, debug: Optional['Debug
         debug: Optional debug instance for logging
     
     Returns:
-        tuple: (allocated_gb, reserved_gb, max_allocated_gb)
+        tuple: (allocated_gb, reserved_gb, max_reserved_gb)
                Returns (0, 0, 0) if no GPU available
     """
     try:
@@ -149,8 +149,8 @@ def get_vram_usage(device: Optional[torch.device] = None, debug: Optional['Debug
                 device = torch.device(device)
             allocated = torch.cuda.memory_allocated(device) / (1024**3)
             reserved = torch.cuda.memory_reserved(device) / (1024**3)
-            max_allocated = torch.cuda.max_memory_allocated(device) / (1024**3)
-            return allocated, reserved, max_allocated
+            max_reserved = torch.cuda.max_memory_reserved(device) / (1024**3)
+            return allocated, reserved, max_reserved
         elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
             # MPS doesn't support per-device queries - uses global memory tracking
             allocated = torch.mps.current_allocated_memory() / (1024**3)
