@@ -142,13 +142,22 @@ class RotaryEmbedding3d(RotaryEmbeddingBase):
         else:
             s = None
             kappa = None
-        freqs = self.get_axial_freqs(T, H, W)
-        q = rearrange(q, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
-        k = rearrange(k, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
-        q = apply_rotary_emb(freqs, q.float()).to(q.dtype)
-        k = apply_rotary_emb(freqs, k.float()).to(k.dtype)
-        q = rearrange(q, "b h T H W d -> b h (T H W) d")
-        k = rearrange(k, "b h T H W d -> b h (T H W) d")
+        if not self.enable_dype:
+            freqs = self.get_axial_freqs(T, H, W)
+            q = rearrange(q, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
+            k = rearrange(k, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
+            q = apply_rotary_emb(freqs, q.float()).to(q.dtype)
+            k = apply_rotary_emb(freqs, k.float()).to(k.dtype)
+            q = rearrange(q, "b h T H W d -> b h (T H W) d")
+            k = rearrange(k, "b h T H W d -> b h (T H W) d")
+        else:
+            freqs = self.get_axial_freqs(T, H, W)
+            q = rearrange(q, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
+            k = rearrange(k, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
+            q = apply_rotary_emb(freqs, q.float()).to(q.dtype)
+            k = apply_rotary_emb(freqs, k.float()).to(k.dtype)
+            q = rearrange(q, "b h T H W d -> b h (T H W) d")
+            k = rearrange(k, "b h T H W d -> b h (T H W) d")
         return q, k
 
 
@@ -225,28 +234,52 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
         else:
             s = None
             kappa = None
-        vid_freqs, txt_freqs = cache(
-            "mmrope_freqs_3d",
-            lambda: self.get_freqs(vid_shape, txt_shape),
-        )
-        target_device = vid_q.device
-        if vid_freqs.device != target_device:
-            vid_freqs = vid_freqs.to(target_device)
-        if txt_freqs.device != target_device:
-            txt_freqs = txt_freqs.to(target_device)
-        vid_q = rearrange(vid_q, "L h d -> h L d")
-        vid_k = rearrange(vid_k, "L h d -> h L d")
-        vid_q = apply_rotary_emb(vid_freqs, vid_q.float()).to(vid_q.dtype)
-        vid_k = apply_rotary_emb(vid_freqs, vid_k.float()).to(vid_k.dtype)
-        vid_q = rearrange(vid_q, "h L d -> L h d")
-        vid_k = rearrange(vid_k, "h L d -> L h d")
+        if not self.enable_dype:
+            vid_freqs, txt_freqs = cache(
+                "mmrope_freqs_3d",
+                lambda: self.get_freqs(vid_shape, txt_shape),
+            )
+            target_device = vid_q.device
+            if vid_freqs.device != target_device:
+                vid_freqs = vid_freqs.to(target_device)
+            if txt_freqs.device != target_device:
+                txt_freqs = txt_freqs.to(target_device)
+            vid_q = rearrange(vid_q, "L h d -> h L d")
+            vid_k = rearrange(vid_k, "L h d -> h L d")
+            vid_q = apply_rotary_emb(vid_freqs, vid_q.float()).to(vid_q.dtype)
+            vid_k = apply_rotary_emb(vid_freqs, vid_k.float()).to(vid_k.dtype)
+            vid_q = rearrange(vid_q, "h L d -> L h d")
+            vid_k = rearrange(vid_k, "h L d -> L h d")
 
-        txt_q = rearrange(txt_q, "L h d -> h L d")
-        txt_k = rearrange(txt_k, "L h d -> h L d")
-        txt_q = apply_rotary_emb(txt_freqs, txt_q.float()).to(txt_q.dtype)
-        txt_k = apply_rotary_emb(txt_freqs, txt_k.float()).to(txt_k.dtype)
-        txt_q = rearrange(txt_q, "h L d -> L h d")
-        txt_k = rearrange(txt_k, "h L d -> L h d")
+            txt_q = rearrange(txt_q, "L h d -> h L d")
+            txt_k = rearrange(txt_k, "L h d -> h L d")
+            txt_q = apply_rotary_emb(txt_freqs, txt_q.float()).to(txt_q.dtype)
+            txt_k = apply_rotary_emb(txt_freqs, txt_k.float()).to(txt_k.dtype)
+            txt_q = rearrange(txt_q, "h L d -> L h d")
+            txt_k = rearrange(txt_k, "h L d -> L h d")
+        else:
+            vid_freqs, txt_freqs = cache(
+                "mmrope_freqs_3d",
+                lambda: self.get_freqs(vid_shape, txt_shape),
+            )
+            target_device = vid_q.device
+            if vid_freqs.device != target_device:
+                vid_freqs = vid_freqs.to(target_device)
+            if txt_freqs.device != target_device:
+                txt_freqs = txt_freqs.to(target_device)
+            vid_q = rearrange(vid_q, "L h d -> h L d")
+            vid_k = rearrange(vid_k, "L h d -> h L d")
+            vid_q = apply_rotary_emb(vid_freqs, vid_q.float()).to(vid_q.dtype)
+            vid_k = apply_rotary_emb(vid_freqs, vid_k.float()).to(vid_k.dtype)
+            vid_q = rearrange(vid_q, "h L d -> L h d")
+            vid_k = rearrange(vid_k, "h L d -> L h d")
+
+            txt_q = rearrange(txt_q, "L h d -> h L d")
+            txt_k = rearrange(txt_k, "L h d -> h L d")
+            txt_q = apply_rotary_emb(txt_freqs, txt_q.float()).to(txt_q.dtype)
+            txt_k = apply_rotary_emb(txt_freqs, txt_k.float()).to(txt_k.dtype)
+            txt_q = rearrange(txt_q, "h L d -> L h d")
+            txt_k = rearrange(txt_k, "h L d -> L h d")
         return vid_q, vid_k, txt_q, txt_k
 
     @torch._dynamo.disable  # Disable compilation: .tolist() is data-dependent and causes graph breaks
