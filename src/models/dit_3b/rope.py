@@ -72,6 +72,22 @@ class RotaryEmbedding3d(RotaryEmbeddingBase):
         torch.FloatTensor,
         torch.FloatTensor,
     ]:
+        """
+        Apply 3D rotary positional embeddings to video queries and keys.
+
+        Args:
+            q, k: Query/key tensors shaped as (batch, heads, tokens, dim).
+            size: Tuple of (T, H, W) latent sizes used to build RoPE frequencies.
+            cache: Optional cache for precomputed RoPE frequency tensors.
+            vid_shape: Optional full video latent shape (B, T, H, W) if provided.
+            window_shape: Optional window-local shape when called from windowed attention.
+
+        Notes:
+            - RoPE sin/cos frequencies are constructed (or retrieved via caching) from
+              the provided `size` using `get_axial_freqs`.
+            - Positional indices for time/height/width are derived from `size` when
+              reshaping q/k before applying the rotary embedding frequencies.
+        """
         T, H, W = size
         freqs = self.get_axial_freqs(T, H, W)
         q = rearrange(q, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
@@ -127,6 +143,24 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
         torch.FloatTensor,
         torch.FloatTensor,
     ]:
+        """
+        Apply multimodal 3D rotary positional embeddings to video and text tokens.
+
+        Args:
+            vid_q, vid_k: Video queries/keys shaped by `vid_shape` (flattened tokens).
+            txt_q, txt_k: Text queries/keys shaped by `txt_shape`.
+            vid_shape: (batch, (temporal, height, width)) layout for video tokens.
+            txt_shape: (batch, length) layout for text tokens.
+            cache: Cache object for sharing/slicing precomputed RoPE frequencies.
+            window_shape: Optional window-local spatial shape when windowed attention is used.
+            full_vid_shape: Optional full video shape when provided by the caller.
+
+        Notes:
+            - This method builds or slices shared RoPE sin/cos frequencies for video
+              (3D indices across time/height/width) and text (1D positions) via `cache`.
+            - Positional indices for each modality are derived from the corresponding
+              shapes before rotating the q/k tensors with the retrieved frequencies.
+        """
         vid_freqs, txt_freqs = cache(
             "mmrope_freqs_3d",
             lambda: self.get_freqs(vid_shape, txt_shape),
