@@ -46,6 +46,9 @@ class NaMMAttention(nn.Module):
         rope_dim: int,
         shared_weights: bool,
         attention_mode: str = 'sdpa',
+        enable_dype: bool = False,
+        dype_lambda_s: Optional[float] = None,
+        dype_lambda_t: Optional[float] = None,
         **kwargs,
     ):
         super().__init__()
@@ -72,7 +75,13 @@ class NaMMAttention(nn.Module):
             shared_weights=shared_weights,
         )
 
-        self.rope = get_na_rope(rope_type=rope_type, dim=rope_dim)
+        self.rope = get_na_rope(
+            rope_type=rope_type,
+            dim=rope_dim,
+            enable_dype=enable_dype,
+            dype_lambda_s=dype_lambda_s,
+            dype_lambda_t=dype_lambda_t,
+        )
         self.attn = FlashAttentionVarlen(attention_mode=attention_mode)
 
     def forward(
@@ -111,10 +120,23 @@ class NaMMAttention(nn.Module):
         if self.rope:
             if self.rope.mm:
                 vid_q, vid_k, txt_q, txt_k = self.rope(
-                    vid_q, vid_k, vid_shape, txt_q, txt_k, txt_shape, cache
+                    vid_q,
+                    vid_k,
+                    vid_shape,
+                    txt_q,
+                    txt_k,
+                    txt_shape,
+                    cache,
+                    full_vid_shape=vid_shape,
                 )
             else:
-                vid_q, vid_k = self.rope(vid_q, vid_k, vid_shape, cache)
+                vid_q, vid_k = self.rope(
+                    vid_q,
+                    vid_k,
+                    vid_shape,
+                    cache,
+                    vid_shape=vid_shape,
+                )
 
         vid_len = cache("vid_len", lambda: vid_shape.prod(-1))
         txt_len = cache("txt_len", lambda: txt_shape.prod(-1))
@@ -149,9 +171,19 @@ class NaSwinAttention(NaMMAttention):
         window: Union[int, Tuple[int, int, int]],
         window_method: str,
         attention_mode: str = 'sdpa',
+        enable_dype: bool = False,
+        dype_lambda_s: Optional[float] = None,
+        dype_lambda_t: Optional[float] = None,
         **kwargs,
     ):
-        super().__init__(*args, attention_mode=attention_mode, **kwargs)
+        super().__init__(
+            *args,
+            attention_mode=attention_mode,
+            enable_dype=enable_dype,
+            dype_lambda_s=dype_lambda_s,
+            dype_lambda_t=dype_lambda_t,
+            **kwargs,
+        )
         self.window = _triple(window)
         self.window_method = window_method
         assert all(map(lambda v: isinstance(v, int) and v >= 0, self.window))
@@ -236,10 +268,25 @@ class NaSwinAttention(NaMMAttention):
                 txt_k_repeat = rearrange(txt_k_repeat, "l (h d) -> l h d", h=num_h)
 
                 vid_q, vid_k, txt_q, txt_k = self.rope(
-                    vid_q, vid_k, window_shape, txt_q_repeat, txt_k_repeat, txt_shape_repeat, cache_win
+                    vid_q,
+                    vid_k,
+                    window_shape,
+                    txt_q_repeat,
+                    txt_k_repeat,
+                    txt_shape_repeat,
+                    cache_win,
+                    full_vid_shape=vid_shape,
+                    window_shape=window_shape,
                 )
             else:
-                vid_q, vid_k = self.rope(vid_q, vid_k, window_shape, cache_win)
+                vid_q, vid_k = self.rope(
+                    vid_q,
+                    vid_k,
+                    window_shape,
+                    cache_win,
+                    vid_shape=vid_shape,
+                    window_shape=window_shape,
+                )
             
         # Attention handles dtype conversion internally using pipeline compute_dtype
         out = self.attn(

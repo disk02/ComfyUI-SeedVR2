@@ -47,15 +47,27 @@ class RotaryEmbeddingBase(nn.Module):
 
 
 class RotaryEmbedding3d(RotaryEmbeddingBase):
-    def __init__(self, dim: int):
+    def __init__(
+        self,
+        dim: int,
+        enable_dype: bool = False,
+        dype_lambda_s: Optional[float] = None,
+        dype_lambda_t: Optional[float] = None,
+    ):
         super().__init__(dim, rope_dim=3)
         self.mm = False
+        self.enable_dype = enable_dype
+        self.dype_lambda_s = dype_lambda_s
+        self.dype_lambda_t = dype_lambda_t
 
     def forward(
         self,
         q: torch.FloatTensor,  # b h l d
         k: torch.FloatTensor,  # b h l d
         size: Tuple[int, int, int],
+        cache: Optional[Cache] = None,
+        vid_shape: Optional[torch.LongTensor] = None,
+        window_shape: Optional[torch.LongTensor] = None,
     ) -> Tuple[
         torch.FloatTensor,
         torch.FloatTensor,
@@ -86,8 +98,17 @@ class MMRotaryEmbeddingBase(RotaryEmbeddingBase):
 
 
 class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
-    def __init__(self, dim: int):
+    def __init__(
+        self,
+        dim: int,
+        enable_dype: bool = False,
+        dype_lambda_s: Optional[float] = None,
+        dype_lambda_t: Optional[float] = None,
+    ):
         super().__init__(dim, rope_dim=3)
+        self.enable_dype = enable_dype
+        self.dype_lambda_s = dype_lambda_s
+        self.dype_lambda_t = dype_lambda_t
 
     def forward(
         self,
@@ -98,6 +119,8 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
         txt_k: torch.FloatTensor,  # L h d
         txt_shape: torch.LongTensor,  # B 1
         cache: Cache,
+        window_shape: Optional[torch.LongTensor] = None,
+        full_vid_shape: Optional[torch.LongTensor] = None,
     ) -> Tuple[
         torch.FloatTensor,
         torch.FloatTensor,
@@ -176,9 +199,20 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
         return torch.cat(vid_freq_list, dim=0), torch.cat(txt_freq_list, dim=0)
 
 
-def get_na_rope(rope_type: Optional[str], dim: int):
+def get_na_rope(
+    rope_type: Optional[str],
+    dim: int,
+    enable_dype: bool = False,
+    dype_lambda_s: Optional[float] = None,
+    dype_lambda_t: Optional[float] = None,
+):
     if rope_type is None:
         return None
     if rope_type == "mmrope3d":
-        return NaMMRotaryEmbedding3d(dim=dim)
+        return NaMMRotaryEmbedding3d(
+            dim=dim,
+            enable_dype=enable_dype,
+            dype_lambda_s=dype_lambda_s,
+            dype_lambda_t=dype_lambda_t,
+        )
     raise NotImplementedError(f"{rope_type} is not supported.")

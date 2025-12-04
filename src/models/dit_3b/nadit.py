@@ -161,6 +161,9 @@ class NaDiT(nn.Module):
                     rope_dim=rope_dim,
                     is_last_layer=(i == num_layers - 1),
                     attention_mode=attention_mode,
+                    enable_dype=enable_dype,
+                    dype_lambda_s=dype_lambda_s,
+                    dype_lambda_t=dype_lambda_t,
                     **kwargs,
                 )
                 for i in range(num_layers)
