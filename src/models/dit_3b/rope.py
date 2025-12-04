@@ -12,6 +12,7 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
+import math
 from functools import lru_cache
 from typing import Optional, Tuple
 import torch
@@ -20,6 +21,48 @@ from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from torch import nn
 
 from ...common.cache import Cache
+
+
+# === DyPE helpers (3B, training-free, 1-step) ===
+
+
+def compute_context_ratio(
+    vid_shape: Optional[torch.LongTensor],
+    train_latent_h: int,
+    train_latent_w: int,
+) -> float:
+    if vid_shape is None:
+        return 1.0
+
+    try:
+        if isinstance(vid_shape, torch.Tensor):
+            if vid_shape.numel() < 2:
+                return 1.0
+            h_latent = vid_shape[-2].item()
+            w_latent = vid_shape[-1].item()
+        else:
+            if len(vid_shape) < 2:
+                return 1.0
+            h_latent = vid_shape[-2]
+            w_latent = vid_shape[-1]
+    except Exception:
+        return 1.0
+
+    s_h = h_latent / float(train_latent_h)
+    s_w = w_latent / float(train_latent_w)
+    s = math.sqrt(s_h * s_w)
+    return float(s)
+
+
+def compute_kappa(
+    lambda_s: Optional[float],
+    lambda_t: Optional[float],
+) -> float:
+    if lambda_s is None:
+        lambda_s = 1.0
+    if lambda_t is None:
+        lambda_t = 1.0
+    return float(lambda_s ** lambda_t)
 
 
 class RotaryEmbeddingBase(nn.Module):
