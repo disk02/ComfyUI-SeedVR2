@@ -21,6 +21,7 @@ from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from torch import nn
 
 from ...common.cache import Cache
+from .window import TRAIN_LATENT_H, TRAIN_LATENT_W
 
 
 # === DyPE helpers (3B, training-free, 1-step) ===
@@ -132,6 +133,15 @@ class RotaryEmbedding3d(RotaryEmbeddingBase):
               reshaping q/k before applying the rotary embedding frequencies.
         """
         T, H, W = size
+        if self.enable_dype:
+            shape_for_ratio = vid_shape if vid_shape is not None else window_shape
+            s = compute_context_ratio(
+                shape_for_ratio, TRAIN_LATENT_H, TRAIN_LATENT_W
+            )
+            kappa = compute_kappa(self.dype_lambda_s, self.dype_lambda_t)
+        else:
+            s = None
+            kappa = None
         freqs = self.get_axial_freqs(T, H, W)
         q = rearrange(q, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
         k = rearrange(k, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
@@ -204,6 +214,17 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
             - Positional indices for each modality are derived from the corresponding
               shapes before rotating the q/k tensors with the retrieved frequencies.
         """
+        if self.enable_dype:
+            shape_for_ratio = (
+                full_vid_shape if full_vid_shape is not None else vid_shape
+            )
+            s = compute_context_ratio(
+                shape_for_ratio, TRAIN_LATENT_H, TRAIN_LATENT_W
+            )
+            kappa = compute_kappa(self.dype_lambda_s, self.dype_lambda_t)
+        else:
+            s = None
+            kappa = None
         vid_freqs, txt_freqs = cache(
             "mmrope_freqs_3d",
             lambda: self.get_freqs(vid_shape, txt_shape),
