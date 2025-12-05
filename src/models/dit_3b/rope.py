@@ -12,6 +12,7 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
+import math
 from functools import lru_cache
 from typing import Optional, Tuple
 import torch
@@ -20,6 +21,62 @@ from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from torch import nn
 
 from ...common.cache import Cache
+from .window import TRAIN_LATENT_H, TRAIN_LATENT_W
+
+
+# === DyPE helpers (3B, training-free, 1-step) ===
+
+
+def compute_context_ratio(
+    vid_shape: Optional[torch.LongTensor],
+    train_latent_h: int,
+    train_latent_w: int,
+) -> float:
+    if vid_shape is None:
+        return 1.0
+
+    try:
+        h_latent = None
+        w_latent = None
+        if isinstance(vid_shape, torch.Tensor):
+            if vid_shape.dim() == 2 and vid_shape.size(1) >= 3:
+                _, h_latent, w_latent = vid_shape[0, :3].tolist()
+            elif vid_shape.dim() == 1 and vid_shape.numel() >= 3:
+                _, h_latent, w_latent = vid_shape[-3:].tolist()
+            elif vid_shape.dim() == 1 and vid_shape.numel() >= 2:
+                h_latent = vid_shape[-2].item()
+                w_latent = vid_shape[-1].item()
+            else:
+                return 1.0
+        else:
+            if len(vid_shape) >= 3:
+                _, h_latent, w_latent = vid_shape[-3:]
+            elif len(vid_shape) >= 2:
+                h_latent = vid_shape[-2]
+                w_latent = vid_shape[-1]
+            else:
+                return 1.0
+    except Exception:
+        return 1.0
+
+    if h_latent is None or w_latent is None:
+        return 1.0
+
+    s_h = h_latent / float(train_latent_h)
+    s_w = w_latent / float(train_latent_w)
+    s = math.sqrt(s_h * s_w)
+    return float(s)
+
+
+def compute_kappa(
+    lambda_s: Optional[float],
+    lambda_t: Optional[float],
+) -> float:
+    if lambda_s is None:
+        lambda_s = 1.0
+    if lambda_t is None:
+        lambda_t = 1.0
+    return float(lambda_s ** lambda_t)
 
 
 class RotaryEmbeddingBase(nn.Module):
@@ -47,27 +104,79 @@ class RotaryEmbeddingBase(nn.Module):
 
 
 class RotaryEmbedding3d(RotaryEmbeddingBase):
-    def __init__(self, dim: int):
+    def __init__(
+        self,
+        dim: int,
+        enable_dype: bool = False,
+        dype_lambda_s: Optional[float] = None,
+        dype_lambda_t: Optional[float] = None,
+    ):
         super().__init__(dim, rope_dim=3)
         self.mm = False
+        self.enable_dype = enable_dype
+        self.dype_lambda_s = dype_lambda_s
+        self.dype_lambda_t = dype_lambda_t
 
     def forward(
         self,
         q: torch.FloatTensor,  # b h l d
         k: torch.FloatTensor,  # b h l d
         size: Tuple[int, int, int],
+        cache: Optional[Cache] = None,
+        vid_shape: Optional[torch.LongTensor] = None,
+        window_shape: Optional[torch.LongTensor] = None,
     ) -> Tuple[
         torch.FloatTensor,
         torch.FloatTensor,
     ]:
+        """
+        Apply 3D rotary positional embeddings to video queries and keys.
+
+        Args:
+            q, k: Query/key tensors shaped as (batch, heads, tokens, dim).
+            size: Tuple of (T, H, W) latent sizes used to build RoPE frequencies.
+            cache: Optional cache for precomputed RoPE frequency tensors.
+            vid_shape: Optional full video latent shape (B, T, H, W) if provided.
+            window_shape: Optional window-local shape when called from windowed attention.
+
+        Notes:
+            - RoPE sin/cos frequencies are constructed (or retrieved via caching) from
+              the provided `size` using `get_axial_freqs`.
+            - Positional indices for time/height/width are derived from `size` when
+              reshaping q/k before applying the rotary embedding frequencies.
+        """
         T, H, W = size
-        freqs = self.get_axial_freqs(T, H, W)
-        q = rearrange(q, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
-        k = rearrange(k, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
-        q = apply_rotary_emb(freqs, q.float()).to(q.dtype)
-        k = apply_rotary_emb(freqs, k.float()).to(k.dtype)
-        q = rearrange(q, "b h T H W d -> b h (T H W) d")
-        k = rearrange(k, "b h T H W d -> b h (T H W) d")
+        if self.enable_dype:
+            shape_for_ratio = vid_shape if vid_shape is not None else window_shape
+            s = compute_context_ratio(
+                shape_for_ratio, TRAIN_LATENT_H, TRAIN_LATENT_W
+            )
+            kappa = compute_kappa(self.dype_lambda_s, self.dype_lambda_t)
+        else:
+            s = None
+            kappa = None
+        if not self.enable_dype:
+            freqs = self.get_axial_freqs(T, H, W)
+            q = rearrange(q, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
+            k = rearrange(k, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
+            q = apply_rotary_emb(freqs, q.float()).to(q.dtype)
+            k = apply_rotary_emb(freqs, k.float()).to(k.dtype)
+            q = rearrange(q, "b h T H W d -> b h (T H W) d")
+            k = rearrange(k, "b h T H W d -> b h (T H W) d")
+        else:
+            freqs = self.get_axial_freqs(T, H, W)
+            raw_scale = (s ** kappa) if s is not None and kappa is not None else 1.0
+            if raw_scale <= 0.0 or not math.isfinite(raw_scale):
+                scaling = 1.0
+            else:
+                scaling = 1.0 / raw_scale
+            freqs = freqs * scaling
+            q = rearrange(q, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
+            k = rearrange(k, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
+            q = apply_rotary_emb(freqs, q.float()).to(q.dtype)
+            k = apply_rotary_emb(freqs, k.float()).to(k.dtype)
+            q = rearrange(q, "b h T H W d -> b h (T H W) d")
+            k = rearrange(k, "b h T H W d -> b h (T H W) d")
         return q, k
 
 
@@ -86,8 +195,17 @@ class MMRotaryEmbeddingBase(RotaryEmbeddingBase):
 
 
 class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
-    def __init__(self, dim: int):
+    def __init__(
+        self,
+        dim: int,
+        enable_dype: bool = False,
+        dype_lambda_s: Optional[float] = None,
+        dype_lambda_t: Optional[float] = None,
+    ):
         super().__init__(dim, rope_dim=3)
+        self.enable_dype = enable_dype
+        self.dype_lambda_s = dype_lambda_s
+        self.dype_lambda_t = dype_lambda_t
 
     def forward(
         self,
@@ -98,34 +216,95 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
         txt_k: torch.FloatTensor,  # L h d
         txt_shape: torch.LongTensor,  # B 1
         cache: Cache,
+        window_shape: Optional[torch.LongTensor] = None,
+        full_vid_shape: Optional[torch.LongTensor] = None,
     ) -> Tuple[
         torch.FloatTensor,
         torch.FloatTensor,
         torch.FloatTensor,
         torch.FloatTensor,
     ]:
-        vid_freqs, txt_freqs = cache(
-            "mmrope_freqs_3d",
-            lambda: self.get_freqs(vid_shape, txt_shape),
-        )
-        target_device = vid_q.device
-        if vid_freqs.device != target_device:
-            vid_freqs = vid_freqs.to(target_device)
-        if txt_freqs.device != target_device:
-            txt_freqs = txt_freqs.to(target_device)
-        vid_q = rearrange(vid_q, "L h d -> h L d")
-        vid_k = rearrange(vid_k, "L h d -> h L d")
-        vid_q = apply_rotary_emb(vid_freqs, vid_q.float()).to(vid_q.dtype)
-        vid_k = apply_rotary_emb(vid_freqs, vid_k.float()).to(vid_k.dtype)
-        vid_q = rearrange(vid_q, "h L d -> L h d")
-        vid_k = rearrange(vid_k, "h L d -> L h d")
+        """
+        Apply multimodal 3D rotary positional embeddings to video and text tokens.
 
-        txt_q = rearrange(txt_q, "L h d -> h L d")
-        txt_k = rearrange(txt_k, "L h d -> h L d")
-        txt_q = apply_rotary_emb(txt_freqs, txt_q.float()).to(txt_q.dtype)
-        txt_k = apply_rotary_emb(txt_freqs, txt_k.float()).to(txt_k.dtype)
-        txt_q = rearrange(txt_q, "h L d -> L h d")
-        txt_k = rearrange(txt_k, "h L d -> L h d")
+        Args:
+            vid_q, vid_k: Video queries/keys shaped by `vid_shape` (flattened tokens).
+            txt_q, txt_k: Text queries/keys shaped by `txt_shape`.
+            vid_shape: (batch, (temporal, height, width)) layout for video tokens.
+            txt_shape: (batch, length) layout for text tokens.
+            cache: Cache object for sharing/slicing precomputed RoPE frequencies.
+            window_shape: Optional window-local spatial shape when windowed attention is used.
+            full_vid_shape: Optional full video shape when provided by the caller.
+
+        Notes:
+            - This method builds or slices shared RoPE sin/cos frequencies for video
+              (3D indices across time/height/width) and text (1D positions) via `cache`.
+            - Positional indices for each modality are derived from the corresponding
+              shapes before rotating the q/k tensors with the retrieved frequencies.
+        """
+        if self.enable_dype:
+            shape_for_ratio = (
+                full_vid_shape if full_vid_shape is not None else vid_shape
+            )
+            s = compute_context_ratio(
+                shape_for_ratio, TRAIN_LATENT_H, TRAIN_LATENT_W
+            )
+            kappa = compute_kappa(self.dype_lambda_s, self.dype_lambda_t)
+        else:
+            s = None
+            kappa = None
+        if not self.enable_dype:
+            vid_freqs, txt_freqs = cache(
+                "mmrope_freqs_3d",
+                lambda: self.get_freqs(vid_shape, txt_shape),
+            )
+            target_device = vid_q.device
+            if vid_freqs.device != target_device:
+                vid_freqs = vid_freqs.to(target_device)
+            if txt_freqs.device != target_device:
+                txt_freqs = txt_freqs.to(target_device)
+            vid_q = rearrange(vid_q, "L h d -> h L d")
+            vid_k = rearrange(vid_k, "L h d -> h L d")
+            vid_q = apply_rotary_emb(vid_freqs, vid_q.float()).to(vid_q.dtype)
+            vid_k = apply_rotary_emb(vid_freqs, vid_k.float()).to(vid_k.dtype)
+            vid_q = rearrange(vid_q, "h L d -> L h d")
+            vid_k = rearrange(vid_k, "h L d -> L h d")
+
+            txt_q = rearrange(txt_q, "L h d -> h L d")
+            txt_k = rearrange(txt_k, "L h d -> h L d")
+            txt_q = apply_rotary_emb(txt_freqs, txt_q.float()).to(txt_q.dtype)
+            txt_k = apply_rotary_emb(txt_freqs, txt_k.float()).to(txt_k.dtype)
+            txt_q = rearrange(txt_q, "h L d -> L h d")
+            txt_k = rearrange(txt_k, "h L d -> L h d")
+        else:
+            vid_freqs, txt_freqs = cache(
+                "mmrope_freqs_3d",
+                lambda: self.get_freqs(vid_shape, txt_shape),
+            )
+            target_device = vid_q.device
+            if vid_freqs.device != target_device:
+                vid_freqs = vid_freqs.to(target_device)
+            if txt_freqs.device != target_device:
+                txt_freqs = txt_freqs.to(target_device)
+            raw_scale = (s ** kappa) if s is not None and kappa is not None else 1.0
+            if raw_scale <= 0.0 or not math.isfinite(raw_scale):
+                scaling = 1.0
+            else:
+                scaling = 1.0 / raw_scale
+            vid_freqs = vid_freqs * scaling
+            vid_q = rearrange(vid_q, "L h d -> h L d")
+            vid_k = rearrange(vid_k, "L h d -> h L d")
+            vid_q = apply_rotary_emb(vid_freqs, vid_q.float()).to(vid_q.dtype)
+            vid_k = apply_rotary_emb(vid_freqs, vid_k.float()).to(vid_k.dtype)
+            vid_q = rearrange(vid_q, "h L d -> L h d")
+            vid_k = rearrange(vid_k, "h L d -> L h d")
+
+            txt_q = rearrange(txt_q, "L h d -> h L d")
+            txt_k = rearrange(txt_k, "L h d -> h L d")
+            txt_q = apply_rotary_emb(txt_freqs, txt_q.float()).to(txt_q.dtype)
+            txt_k = apply_rotary_emb(txt_freqs, txt_k.float()).to(txt_k.dtype)
+            txt_q = rearrange(txt_q, "h L d -> L h d")
+            txt_k = rearrange(txt_k, "h L d -> L h d")
         return vid_q, vid_k, txt_q, txt_k
 
     @torch._dynamo.disable  # Disable compilation: .tolist() is data-dependent and causes graph breaks
@@ -176,9 +355,20 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
         return torch.cat(vid_freq_list, dim=0), torch.cat(txt_freq_list, dim=0)
 
 
-def get_na_rope(rope_type: Optional[str], dim: int):
+def get_na_rope(
+    rope_type: Optional[str],
+    dim: int,
+    enable_dype: bool = False,
+    dype_lambda_s: Optional[float] = None,
+    dype_lambda_t: Optional[float] = None,
+):
     if rope_type is None:
         return None
     if rope_type == "mmrope3d":
-        return NaMMRotaryEmbedding3d(dim=dim)
+        return NaMMRotaryEmbedding3d(
+            dim=dim,
+            enable_dype=enable_dype,
+            dype_lambda_s=dype_lambda_s,
+            dype_lambda_t=dype_lambda_t,
+        )
     raise NotImplementedError(f"{rope_type} is not supported.")

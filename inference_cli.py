@@ -1460,7 +1460,10 @@ def _process_frames_core(
         tile_debug=args.tile_debug.lower() if args.tile_debug else "false",
         attention_mode=args.attention_mode,
         torch_compile_args_dit=torch_compile_args_dit,
-        torch_compile_args_vae=torch_compile_args_vae
+        torch_compile_args_vae=torch_compile_args_vae,
+        enable_dype=args.enable_dype,
+        dype_lambda_s=args.dype_lambda_s,
+        dype_lambda_t=args.dype_lambda_t
     )
     
     ctx['cache_context'] = cache_context
@@ -1903,7 +1906,16 @@ Examples:
                         help="Max cached compiled versions per function. Increase when using many different input shapes. Higher uses more memory (default: 64)")
     perf_group.add_argument("--compile_dynamo_recompile_limit", type=int, default=128,
                         help="Max recompilation attempts before fallback to eager mode. Safety limit to prevent compilation loops (default: 128)")
-    
+
+    # DyPE configuration (plumbing only, no behavior change)
+    dype_group = parser.add_argument_group('DyPE configuration')
+    dype_group.add_argument("--enable_dype", action="store_true",
+                        help="Enable DyPE configuration plumbing (no change to current outputs)")
+    dype_group.add_argument("--dype_lambda_s", type=float, default=1.0,
+                        help="DyPE strength parameter (configuration only; default: 1.0)")
+    dype_group.add_argument("--dype_lambda_t", type=float, default=1.0,
+                        help="DyPE shaping parameter (configuration only; default: 1.0)")
+
     # Model Caching (for batch processing)
     cache_group = parser.add_argument_group('Model caching (batch processing)')
     cache_group.add_argument("--cache_dit", action="store_true",

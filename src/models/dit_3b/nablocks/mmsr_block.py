@@ -12,7 +12,7 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
-from typing import Tuple
+from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
@@ -48,6 +48,9 @@ class NaMMSRTransformerBlock(nn.Module):
         rope_dim: int,
         is_last_layer: bool,
         attention_mode: str = 'sdpa',
+        enable_dype: bool = False,
+        dype_lambda_s: Optional[float] = None,
+        dype_lambda_t: Optional[float] = None,
         **kwargs,
     ):
         super().__init__()
@@ -66,6 +69,9 @@ class NaMMSRTransformerBlock(nn.Module):
             rope_dim=rope_dim,
             shared_weights=shared_weights,
             attention_mode=attention_mode,
+            enable_dype=enable_dype,
+            dype_lambda_s=dype_lambda_s,
+            dype_lambda_t=dype_lambda_t,
             window=kwargs.pop("window", None),
             window_method=kwargs.pop("window_method", None),
         )

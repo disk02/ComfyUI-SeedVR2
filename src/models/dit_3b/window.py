@@ -16,6 +16,10 @@ from math import ceil
 from typing import Tuple
 import math
 
+# NEW: latent training baseline for 720p (used for DyPE and window heuristics)
+TRAIN_LATENT_H = 45
+TRAIN_LATENT_W = 80
+
 def get_window_op(name: str):
     if name == "720pwin_by_size_bysize":
         return make_720Pwindows_bysize
@@ -29,7 +33,7 @@ def make_720Pwindows_bysize(size: Tuple[int, int, int], num_windows: Tuple[int, 
     t, h, w = size
     resized_nt, resized_nh, resized_nw = num_windows
     #cal windows under 720p
-    scale = math.sqrt((45 * 80) / (h * w))
+    scale = math.sqrt((TRAIN_LATENT_H * TRAIN_LATENT_W) / (h * w))
     resized_h, resized_w = round(h * scale), round(w * scale)
     wh, ww = ceil(resized_h / resized_nh), ceil(resized_w / resized_nw)  # window size.
     wt = ceil(min(t, 30) / resized_nt)  # window size.
@@ -52,7 +56,7 @@ def make_shifted_720Pwindows_bysize(size: Tuple[int, int, int], num_windows: Tup
     t, h, w = size
     resized_nt, resized_nh, resized_nw = num_windows
     #cal windows under 720p
-    scale = math.sqrt((45 * 80) / (h * w))
+    scale = math.sqrt((TRAIN_LATENT_H * TRAIN_LATENT_W) / (h * w))
     resized_h, resized_w = round(h * scale), round(w * scale)
     wh, ww = ceil(resized_h / resized_nh), ceil(resized_w / resized_nw)  # window size.
     wt = ceil(min(t, 30) / resized_nt)  # window size.

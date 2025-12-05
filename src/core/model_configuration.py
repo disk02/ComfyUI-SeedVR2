@@ -746,7 +746,10 @@ def configure_runner(
     tile_debug: str = "false",
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-    torch_compile_args_vae: Optional[Dict[str, Any]] = None
+    torch_compile_args_vae: Optional[Dict[str, Any]] = None,
+    enable_dype: bool = False,
+    dype_lambda_s: float = 1.0,
+    dype_lambda_t: float = 1.0
 ) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
     """
     Configure VideoDiffusionInfer runner with model loading and settings.
@@ -774,6 +777,9 @@ def configure_runner(
         attention_mode: Attention computation backend ('sdpa' or 'flash_attn')
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
+        enable_dype: Enable DyPE configuration plumbing (no behavior change)
+        dype_lambda_s: DyPE strength parameter (plumbing only)
+        dype_lambda_t: DyPE shaping parameter (plumbing only)
         
     Returns:
         Tuple[VideoDiffusionInfer, Dict[str, Any]]: (configured runner, cache context dict)
@@ -800,9 +806,18 @@ def configure_runner(
     
     # Phase 2: Get or create runner
     runner = _acquire_runner(
-        cache_context, dit_model, vae_model, 
+        cache_context, dit_model, vae_model,
         base_cache_dir, debug
     )
+
+    # Apply DyPE configuration overrides when available in the 3B config
+    dit_model_config = getattr(runner.config.dit, 'model', None)
+    if dit_model_config is not None and 'enable_dype' in dit_model_config:
+        runner.config.dit.model.enable_dype = enable_dype
+        runner.config.dit.model.dype_lambda_s = dype_lambda_s
+        runner.config.dit.model.dype_lambda_t = dype_lambda_t
+
+    # TODO: Mirror DyPE configuration plumbing for the 7B model once 3B is validated.
     
     # Phase 3: Configure runner settings
     _configure_runner_settings(
