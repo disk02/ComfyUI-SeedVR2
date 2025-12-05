@@ -36,17 +36,30 @@ def compute_context_ratio(
         return 1.0
 
     try:
+        h_latent = None
+        w_latent = None
         if isinstance(vid_shape, torch.Tensor):
-            if vid_shape.numel() < 2:
+            if vid_shape.dim() == 2 and vid_shape.size(1) >= 3:
+                _, h_latent, w_latent = vid_shape[0, :3].tolist()
+            elif vid_shape.dim() == 1 and vid_shape.numel() >= 3:
+                _, h_latent, w_latent = vid_shape[-3:].tolist()
+            elif vid_shape.dim() == 1 and vid_shape.numel() >= 2:
+                h_latent = vid_shape[-2].item()
+                w_latent = vid_shape[-1].item()
+            else:
                 return 1.0
-            h_latent = vid_shape[-2].item()
-            w_latent = vid_shape[-1].item()
         else:
-            if len(vid_shape) < 2:
+            if len(vid_shape) >= 3:
+                _, h_latent, w_latent = vid_shape[-3:]
+            elif len(vid_shape) >= 2:
+                h_latent = vid_shape[-2]
+                w_latent = vid_shape[-1]
+            else:
                 return 1.0
-            h_latent = vid_shape[-2]
-            w_latent = vid_shape[-1]
     except Exception:
+        return 1.0
+
+    if h_latent is None or w_latent is None:
         return 1.0
 
     s_h = h_latent / float(train_latent_h)
