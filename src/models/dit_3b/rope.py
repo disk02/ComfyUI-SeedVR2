@@ -152,6 +152,8 @@ class RotaryEmbedding3d(RotaryEmbeddingBase):
             k = rearrange(k, "b h T H W d -> b h (T H W) d")
         else:
             freqs = self.get_axial_freqs(T, H, W)
+            scaling = (s ** kappa) if s is not None and kappa is not None else 1.0
+            freqs = freqs * scaling
             q = rearrange(q, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
             k = rearrange(k, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
             q = apply_rotary_emb(freqs, q.float()).to(q.dtype)
@@ -267,6 +269,8 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
                 vid_freqs = vid_freqs.to(target_device)
             if txt_freqs.device != target_device:
                 txt_freqs = txt_freqs.to(target_device)
+            scaling = (s ** kappa) if s is not None and kappa is not None else 1.0
+            vid_freqs = vid_freqs * scaling
             vid_q = rearrange(vid_q, "L h d -> h L d")
             vid_k = rearrange(vid_k, "L h d -> h L d")
             vid_q = apply_rotary_emb(vid_freqs, vid_q.float()).to(vid_q.dtype)
